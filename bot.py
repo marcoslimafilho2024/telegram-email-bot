@@ -439,6 +439,36 @@ async def cmd_marcar_lido(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 @only_authorized
+async def cmd_pessoal_gmail(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Lê somente a conta pessoal cnp.marcoslima@gmail.com"""
+    pessoal = next((a for a in ACCOUNTS if 'cnp' in a['user']), None)
+    if not pessoal:
+        await update.message.reply_text('❌ Conta pessoal não configurada.')
+        return
+    await update.message.reply_text(f'🔍 Lendo {pessoal["user"]}...')
+    try:
+        mail = get_imap(pessoal['user'], pessoal['password'], readonly=True)
+        ids = search_unseen(mail, hours=None)
+        total = len(ids)
+        buckets = {k: [] for k in ICONS}
+        spam_count = 0
+        for eid, sender, subject in fetch_headers(mail, ids, limit=100):
+            if is_spam(sender, subject):
+                spam_count += 1
+                continue
+            cat = classify(sender, subject)
+            name = sender.split('<')[0].strip().strip('"') or sender
+            name = name[:35] + '...' if len(name) > 35 else name
+            sub = subject[:55] + '...' if len(subject) > 55 else subject
+            buckets[cat].append(f'• {sub}\n  ↳ {name}')
+        mail.logout()
+        msg = build_message(buckets, f'👤 Pessoal ({pessoal["user"]}) — {total} não lidos, {spam_count} propagandas')
+        await update.message.reply_text(msg)
+    except Exception as e:
+        await update.message.reply_text(f'❌ Erro: {e}')
+
+
+@only_authorized
 async def cmd_varredura(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text('🔍 Varrendo caixa de entrada...')
     try:
@@ -555,6 +585,12 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await cmd_pessoal(update, context)
 
     elif any(w in text for w in [
+        'email pessoal', 'emails pessoais', 'cnp', 'gmail pessoal',
+        'meu pessoal', 'conta pessoal', 'ler pessoal',
+    ]):
+        await cmd_pessoal_gmail(update, context)
+
+    elif any(w in text for w in [
         'varredura', 'varrer', 'buscar alertas', 'busca agora', 'checar agora',
         'verificar agora', 'procurar clientes', 'scan',
     ]):
@@ -612,6 +648,7 @@ def main():
     app.add_handler(CommandHandler('profissional', cmd_profissional))
     app.add_handler(CommandHandler('financeiro', cmd_financeiro))
     app.add_handler(CommandHandler('pessoal', cmd_pessoal))
+    app.add_handler(CommandHandler('cnp', cmd_pessoal_gmail))
     app.add_handler(CommandHandler('varredura', cmd_varredura))
     app.add_handler(CommandHandler('alertas', cmd_alertas))
     app.add_handler(CommandHandler('marcar', cmd_marcar_lido))
