@@ -292,39 +292,162 @@ async def cmd_marcar_lido(update: Update, context: ContextTypes.DEFAULT_TYPE):
 @only_authorized
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        '🤖 Comandos disponíveis:\n\n'
-        '📬 emails — resumo geral (últimas 24h)\n'
-        '📊 todos — conta todos os não lidos por categoria\n'
-        '🔴 urgente — urgentes (sem limite de data)\n'
-        '💰 vendas — novas vendas\n'
-        '👨‍💼 profissional — jurídico, tributário\n'
-        '✅ marcar lido — marca TODOS como lidos\n'
-        '❓ ajuda — esta mensagem\n\n'
-        'Pode escrever em texto livre também!'
+        '🤖 O que você pode perguntar:\n\n'
+        '📊 "ler os 1000 emails" — resumo geral\n'
+        '☀️ "o que chegou hoje?" — últimas 24h\n'
+        '📅 "e essa semana?" — últimos 7 dias\n'
+        '🔴 "tem algo urgente?" — urgentes\n'
+        '💰 "quanto vendi?" — vendas\n'
+        '👨‍💼 "ver profissional" — jurídico/tributário\n'
+        '💳 "ver financeiro" — XP, Pix, banco\n'
+        '👦 "email do davi?" — pessoal/escola\n'
+        '✅ "zera a caixa" — marca tudo como lido\n\n'
+        'Fale naturalmente — eu entendo!'
     )
+
+
+@only_authorized
+async def cmd_hoje(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text('🔍 Emails de hoje...')
+    buckets, total, spam, err = fetch_emails(hours=24, limit=100)
+    if err:
+        await update.message.reply_text(f'❌ Erro: {err}')
+        return
+    await update.message.reply_text(build_message(buckets, f'📬 Hoje — {total} emails, {spam} propagandas'))
+
+
+@only_authorized
+async def cmd_semana(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text('🔍 Emails da semana (7 dias)...')
+    buckets, total, spam, err = fetch_emails(hours=168, limit=200)
+    if err:
+        await update.message.reply_text(f'❌ Erro: {err}')
+        return
+    await update.message.reply_text(build_message(buckets, f'📬 Semana — {total} emails, {spam} propagandas'))
+
+
+@only_authorized
+async def cmd_financeiro(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    buckets, total, spam, err = fetch_emails(hours=None, only_cat='FINANCEIRO', limit=100)
+    if err:
+        await update.message.reply_text(f'❌ Erro: {err}')
+        return
+    items = buckets.get('FINANCEIRO', [])
+    msg = (f'💳 FINANCEIRO ({len(items)})\n\n' + '\n'.join(items[:30])) if items else '📭 Nenhum email financeiro.'
+    await update.message.reply_text(msg)
+
+
+@only_authorized
+async def cmd_pessoal(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    buckets, total, spam, err = fetch_emails(hours=None, only_cat='PESSOAL', limit=100)
+    if err:
+        await update.message.reply_text(f'❌ Erro: {err}')
+        return
+    items = buckets.get('PESSOAL', [])
+    msg = (f'👦 PESSOAL ({len(items)})\n\n' + '\n'.join(items[:30])) if items else '📭 Nenhum email pessoal.'
+    await update.message.reply_text(msg)
 
 
 @only_authorized
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.lower().strip()
 
-    if any(w in text for w in ['todos', 'tudo', '1000', 'pendentes', 'quantos', 'fila', 'geral']):
+    # --- TODOS / GERAL ---
+    if any(w in text for w in [
+        'todos', 'tudo', '1000', '1.000', 'pendentes', 'quantos', 'fila',
+        'geral', 'não lidos', 'nao lidos', 'caixa toda', 'caixa inteira',
+        'ler tudo', 'ver tudo', 'listar tudo', 'me mostra tudo',
+        'ultimos 1000', 'últimos 1000', 'quanto tem', 'quantos tem',
+        'overview', 'visao geral', 'visão geral',
+    ]):
         await cmd_todos(update, context)
-    elif any(w in text for w in ['email', 'emails', 'ler', 'leia', 'resumo', 'caixa', 'inbox']):
-        await cmd_emails(update, context)
-    elif any(w in text for w in ['urgente', 'urgentes', 'importante', 'importantes', 'critico']):
+
+    # --- HOJE ---
+    elif any(w in text for w in [
+        'hoje', 'do dia', 'chegou hoje', 'recebi hoje',
+        'ultimas 24', 'últimas 24', 'ultimo dia', 'último dia',
+    ]):
+        await cmd_hoje(update, context)
+
+    # --- SEMANA ---
+    elif any(w in text for w in [
+        'semana', 'essa semana', 'esta semana', 'ultimos 7', 'últimos 7',
+        'semana toda', 'da semana',
+    ]):
+        await cmd_semana(update, context)
+
+    # --- URGENTE ---
+    elif any(w in text for w in [
+        'urgente', 'urgentes', 'importante', 'importantes', 'critico',
+        'criticos', 'crítico', 'críticos', 'atenção', 'atencao',
+        'precisa de acao', 'precisa de ação', 'resolver', 'pendencia',
+        'pendência', 'prazo', 'vencer', 'vencendo', 'gestta',
+        'certificado', 'regularize', 'pgfn',
+    ]):
         await cmd_urgente(update, context)
-    elif any(w in text for w in ['venda', 'vendas', 'vendi', 'vendeu']):
+
+    # --- VENDAS ---
+    elif any(w in text for w in [
+        'venda', 'vendas', 'vendi', 'vendeu', 'vendemos',
+        'hotmart', 'eduzz', 'faturamento', 'receita', 'compra',
+        'novo aluno', 'nova venda', 'quanto vendi',
+    ]):
         await cmd_vendas(update, context)
-    elif any(w in text for w in ['profissional', 'juridico', 'tributario', 'conjur', 'legisweb']):
+
+    # --- PROFISSIONAL ---
+    elif any(w in text for w in [
+        'profissional', 'juridico', 'tributario', 'conjur', 'legisweb',
+        'jurídico', 'tributário', 'reforma tributaria', 'reforma tributária',
+        'boletim', 'legislacao', 'legislação', 'norma',
+    ]):
         await cmd_profissional(update, context)
-    elif any(w in text for w in ['marcar', 'lido', 'lidos', 'arquivar', 'limpar', 'zerar']):
+
+    # --- FINANCEIRO ---
+    elif any(w in text for w in [
+        'financeiro', 'financeira', 'xp', 'xpi', 'pix', 'banco',
+        'extrato', 'transferencia', 'transferência', 'investimento',
+    ]):
+        await cmd_financeiro(update, context)
+
+    # --- PESSOAL ---
+    elif any(w in text for w in [
+        'pessoal', 'davi', 'escola', 'familia', 'família',
+        'colmaster', 'nota', 'filho',
+    ]):
+        await cmd_pessoal(update, context)
+
+    # --- MARCAR LIDO ---
+    elif any(w in text for w in [
+        'marcar', 'lido', 'lidos', 'arquivar', 'limpar', 'zerar',
+        'zerar caixa', 'limpa tudo', 'marca lido', 'marca todos',
+        'marcar todos', 'marcar como lido', 'mark as read',
+        'limpa inbox', 'zera inbox', 'apagar notificacoes',
+    ]):
         await cmd_marcar_lido(update, context)
-    elif any(w in text for w in ['ajuda', 'help', 'comandos', 'menu']):
+
+    # --- EMAILS GERAIS (fallback) ---
+    elif any(w in text for w in [
+        'email', 'emails', 'ler', 'leia', 'resumo', 'caixa', 'inbox',
+        'mensagem', 'mensagens', 'me mostra', 'o que tem',
+    ]):
+        await cmd_todos(update, context)
+
+    # --- AJUDA ---
+    elif any(w in text for w in ['ajuda', 'help', 'comandos', 'menu', 'o que voce faz', 'o que você faz']):
         await cmd_help(update, context)
+
     else:
         await update.message.reply_text(
-            'Não entendi 😅\n\nTente: todos, emails, urgente, vendas, marcar lido, ajuda'
+            'Não entendi 😅\n\n'
+            'Exemplos do que você pode dizer:\n\n'
+            '• "ler os 1000 emails"\n'
+            '• "tem algo urgente?"\n'
+            '• "quanto vendi essa semana?"\n'
+            '• "o que chegou hoje?"\n'
+            '• "zera a caixa"\n'
+            '• "tem email do davi?"\n'
+            '• "ver financeiro"\n\n'
+            'Digite ajuda para ver todos os comandos.'
         )
 
 
@@ -333,9 +456,13 @@ def main():
     app.add_handler(CommandHandler('start', cmd_todos))
     app.add_handler(CommandHandler('todos', cmd_todos))
     app.add_handler(CommandHandler('emails', cmd_emails))
+    app.add_handler(CommandHandler('hoje', cmd_hoje))
+    app.add_handler(CommandHandler('semana', cmd_semana))
     app.add_handler(CommandHandler('urgente', cmd_urgente))
     app.add_handler(CommandHandler('vendas', cmd_vendas))
     app.add_handler(CommandHandler('profissional', cmd_profissional))
+    app.add_handler(CommandHandler('financeiro', cmd_financeiro))
+    app.add_handler(CommandHandler('pessoal', cmd_pessoal))
     app.add_handler(CommandHandler('marcar', cmd_marcar_lido))
     app.add_handler(CommandHandler('ajuda', cmd_help))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
