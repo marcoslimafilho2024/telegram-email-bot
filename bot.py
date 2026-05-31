@@ -59,6 +59,9 @@ ALERT_KEYWORDS = [
     'instituto ect', 'instituto de educacao contabil',
     'deusamim', 'vg braga', 'braga reis',
     '4 estylos', 'erico brasil',
+    # Remetentes específicos monitorados
+    'cfla', 'cfla-intl', 'serviceclient@cfla', 't1134',
+    'raquel brito', 'quellbrito@hotmail', 'rafaelabbrito',
     # Ações urgentes
     'intimação', 'intimacao', 'auto de infração', 'auto de infracao',
     'embargo', 'autuação', 'autuacao', 'notificação fiscal', 'notificacao fiscal',
