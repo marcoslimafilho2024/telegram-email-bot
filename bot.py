@@ -401,6 +401,41 @@ async def cmd_marcar_lido(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 @only_authorized
+async def cmd_varredura(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text('🔍 Varrendo caixa de entrada...')
+    try:
+        mail = get_imap(readonly=True)
+        ids = search_unseen(mail, hours=None)
+        total = len(ids)
+        encontrados = []
+        for eid, sender, subject in fetch_headers(mail, ids, limit=500):
+            kw = match_alert(sender, subject)
+            if kw:
+                name = sender.split('<')[0].strip().strip('"') or sender
+                name = name[:35] + '...' if len(name) > 35 else name
+                sub = subject[:55] + '...' if len(subject) > 55 else subject
+                encontrados.append((kw, sub, name))
+        mail.logout()
+
+        if not encontrados:
+            await update.message.reply_text(
+                f'✅ Varredura concluída — {total} emails analisados\n'
+                f'Nenhum email com palavras-chave críticas encontrado.'
+            )
+            return
+
+        lines = [f'🚨 VARREDURA — {len(encontrados)} alertas em {total} emails\n']
+        for kw, sub, name in encontrados[:30]:
+            lines.append(f'⚡ [{kw.upper()}]\n• {sub}\n  ↳ {name}\n')
+        msg = '\n'.join(lines)
+        await update.message.reply_text(msg)
+        if len(encontrados) > 30:
+            await update.message.reply_text(f'... e mais {len(encontrados)-30} emails com alertas.')
+    except Exception as e:
+        await update.message.reply_text(f'❌ Erro na varredura: {e}')
+
+
+@only_authorized
 async def cmd_alertas(update: Update, context: ContextTypes.DEFAULT_TYPE):
     kws = '\n'.join(f'• {k}' for k in sorted(ALERT_KEYWORDS))
     await update.message.reply_text(f'🚨 Palavras-chave monitoradas ({len(ALERT_KEYWORDS)}):\n\n{kws}')
@@ -480,6 +515,12 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await cmd_pessoal(update, context)
 
     elif any(w in text for w in [
+        'varredura', 'varrer', 'buscar alertas', 'busca agora', 'checar agora',
+        'verificar agora', 'procurar clientes', 'scan',
+    ]):
+        await cmd_varredura(update, context)
+
+    elif any(w in text for w in [
         'alerta', 'alertas', 'monitorando', 'palavras', 'palavras-chave', 'keywords',
     ]):
         await cmd_alertas(update, context)
@@ -531,6 +572,7 @@ def main():
     app.add_handler(CommandHandler('profissional', cmd_profissional))
     app.add_handler(CommandHandler('financeiro', cmd_financeiro))
     app.add_handler(CommandHandler('pessoal', cmd_pessoal))
+    app.add_handler(CommandHandler('varredura', cmd_varredura))
     app.add_handler(CommandHandler('alertas', cmd_alertas))
     app.add_handler(CommandHandler('marcar', cmd_marcar_lido))
     app.add_handler(CommandHandler('ajuda', cmd_help))
