@@ -16,30 +16,34 @@ SPAM_SENDERS = [
     'grancursosonline', 'serasa', 'smiles.com', 'facebookmail',
     'insiderstore', 'wispr.ai', 'academia-mail', 'hotmilhas',
     'retornar.com', 'accor', 'reminders@', 'news.all@mail',
+    'grancursos', 'empiricus', 'infomoney', 'spressovc',
 ]
 SPAM_SUBJECTS = [
     '% off', 'cupom', 'oferta imperd', 'passagem', 'megapromo',
     'economize', 'desconto extra', 'prorrogamos', 'feirao', 'feirão',
-    'voucher', 'milhas', 'resort', 'promo',
+    'voucher', 'milhas', 'resort', 'promo', 'black friday',
+    'ultima chance', 'última chance', 'imperdivel', 'imperdível',
 ]
 URGENT_SENDERS = [
     'atendimento@compliance-ce.com.br', 'pgfn.gov.br', 'qive.com.br',
     'sigmavaf.com.br', 'accounts.google.com', 'adveronix.com',
     'regularize', 'receita.fazenda', 'flex-wind.com', 'tailscale',
+    'sefaz', 'prefeitura', 'tce.', 'tribunal',
 ]
 URGENT_SUBJECTS = [
     'gestta', 'vencer', 'certificado', 'regularize', 'seguranca',
     'segurança', 'prefeitura', 'pgfn', 'multa', 'vencimento',
     'prazo', 'pendencia', 'pendência', 'provisao', 'provisão',
-    'reversao', 'reversão', 'trial ends',
+    'reversao', 'reversão', 'trial ends', 'notificacao', 'notificação',
+    'intimacao', 'intimação', 'auto de infração', 'embargo',
 ]
 SALES_SENDERS = ['eduzz.com', 'hotmart.com']
 PROFESSIONAL_SENDERS = [
     'conjur.com.br', 'legisweb.com.br', 'reformatributaria.com.br',
-    'fbc.org.br',
+    'fbc.org.br', 'contabil', 'tributar',
 ]
-PERSONAL_SENDERS = ['colmaster.com.br']
-FINANCIAL_SENDERS = ['xpi.com.br', 'xpi.com']
+PERSONAL_SENDERS = ['colmaster.com.br', 'isabelbtz@gmail']
+FINANCIAL_SENDERS = ['xpi.com.br', 'xpi.com', 'nubank', 'itau', 'bradesco', 'bb.com.br']
 
 ICONS = {
     'URGENTE': '🔴',
@@ -84,19 +88,32 @@ def classify(sender, subject):
     return 'OUTROS'
 
 
-def fetch_emails(hours=24, only_cat=None):
-    try:
-        mail = imaplib.IMAP4_SSL('imap.gmail.com')
-        mail.login(GMAIL_USER, GMAIL_APP_PASSWORD)
-        mail.select('inbox', readonly=True)
+def get_imap(readonly=True):
+    mail = imaplib.IMAP4_SSL('imap.gmail.com')
+    mail.login(GMAIL_USER, GMAIL_APP_PASSWORD)
+    mail.select('inbox', readonly=readonly)
+    return mail
 
+
+def search_unseen(mail, hours=None):
+    if hours:
         since = (datetime.now() - timedelta(hours=hours)).strftime('%d-%b-%Y')
         _, data = mail.search(None, f'(UNSEEN SINCE {since})')
-        ids = data[0].split()
+    else:
+        _, data = mail.search(None, 'UNSEEN')
+    return data[0].split()
+
+
+def fetch_emails(hours=None, only_cat=None, limit=100):
+    try:
+        mail = get_imap(readonly=True)
+        ids = search_unseen(mail, hours)
+        total_unseen = len(ids)
 
         buckets = {k: [] for k in ICONS}
+        spam_count = 0
 
-        for eid in ids[-60:]:
+        for eid in ids[-limit:]:
             _, msg_data = mail.fetch(eid, '(BODY.PEEK[HEADER.FIELDS (FROM SUBJECT)])')
             raw = msg_data[0][1]
             msg = email.message_from_bytes(raw)
@@ -104,6 +121,7 @@ def fetch_emails(hours=24, only_cat=None):
             subject = decode_str(msg.get('Subject', '(sem assunto)'))
 
             if is_spam(sender, subject):
+                spam_count += 1
                 continue
 
             cat = classify(sender, subject)
@@ -116,9 +134,52 @@ def fetch_emails(hours=24, only_cat=None):
             buckets[cat].append(f'• {sub}\n  ↳ {name}')
 
         mail.logout()
-        return buckets, None
+        return buckets, total_unseen, spam_count, None
     except Exception as e:
-        return None, str(e)
+        return None, 0, 0, str(e)
+
+
+def count_by_category(hours=None, limit=500):
+    """Conta emails por categoria sem listar detalhes — rápido para volumes grandes."""
+    try:
+        mail = get_imap(readonly=True)
+        ids = search_unseen(mail, hours)
+        total = len(ids)
+
+        counts = {k: 0 for k in ICONS}
+        spam = 0
+
+        for eid in ids[-limit:]:
+            _, msg_data = mail.fetch(eid, '(BODY.PEEK[HEADER.FIELDS (FROM SUBJECT)])')
+            raw = msg_data[0][1]
+            msg = email.message_from_bytes(raw)
+            sender = decode_str(msg.get('From', ''))
+            subject = decode_str(msg.get('Subject', ''))
+
+            if is_spam(sender, subject):
+                spam += 1
+                continue
+            counts[classify(sender, subject)] += 1
+
+        mail.logout()
+        return total, counts, spam, None
+    except Exception as e:
+        return 0, {}, 0, str(e)
+
+
+def mark_as_read(hours=None):
+    try:
+        mail = get_imap(readonly=False)
+        ids = search_unseen(mail, hours)
+        if ids:
+            # Marcar em lotes de 100 para evitar timeout
+            for i in range(0, len(ids), 100):
+                batch = ids[i:i+100]
+                mail.store(b','.join(batch), '+FLAGS', '\\Seen')
+        mail.logout()
+        return len(ids)
+    except Exception as e:
+        return -1
 
 
 def build_message(buckets, title='📬 Emails não lidos'):
@@ -135,22 +196,6 @@ def build_message(buckets, title='📬 Emails não lidos'):
     return '\n'.join(lines).strip()
 
 
-def mark_as_read(hours=24):
-    try:
-        mail = imaplib.IMAP4_SSL('imap.gmail.com')
-        mail.login(GMAIL_USER, GMAIL_APP_PASSWORD)
-        mail.select('inbox', readonly=False)
-        since = (datetime.now() - timedelta(hours=hours)).strftime('%d-%b-%Y')
-        _, data = mail.search(None, f'(UNSEEN SINCE {since})')
-        ids = data[0].split()
-        if ids:
-            mail.store(b','.join(ids), '+FLAGS', '\\Seen')
-        mail.logout()
-        return len(ids)
-    except Exception as e:
-        return -1
-
-
 def only_authorized(func):
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if update.effective_chat.id != CHAT_ID:
@@ -162,56 +207,84 @@ def only_authorized(func):
 @only_authorized
 async def cmd_emails(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text('🔍 Lendo emails das últimas 24h...')
-    buckets, err = fetch_emails(hours=24)
-    if err:
-        await update.message.reply_text(f'❌ Erro ao ler Gmail: {err}')
-        return
-    await update.message.reply_text(build_message(buckets))
-
-
-@only_authorized
-async def cmd_urgente(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text('🔍 Buscando urgentes (48h)...')
-    buckets, err = fetch_emails(hours=48, only_cat='URGENTE')
+    buckets, total, spam, err = fetch_emails(hours=24, limit=100)
     if err:
         await update.message.reply_text(f'❌ Erro: {err}')
         return
-    items = buckets.get('URGENTE', [])
-    msg = ('🔴 URGENTE\n\n' + '\n'.join(items)) if items else '✅ Nenhum urgente.'
+    msg = build_message(buckets, f'📬 Emails não lidos (24h) — {total} total, {spam} propagandas ignoradas')
     await update.message.reply_text(msg)
 
 
 @only_authorized
+async def cmd_todos(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text('🔍 Contando TODOS os emails não lidos (pode demorar um pouco)...')
+    total, counts, spam, err = count_by_category(hours=None, limit=500)
+    if err:
+        await update.message.reply_text(f'❌ Erro: {err}')
+        return
+
+    lines = [f'📊 RESUMO GERAL — {total} emails não lidos\n']
+    for cat, n in counts.items():
+        if n > 0:
+            lines.append(f'{ICONS[cat]} {cat}: {n}')
+    lines.append(f'🗑️ Propaganda (ignorada): {spam}')
+    nao_contados = total - sum(counts.values()) - spam
+    if nao_contados > 0:
+        lines.append(f'⚠️ Emails além do limite analisado: ~{nao_contados}')
+    lines.append('\nUse "urgente", "vendas" ou "emails" para ver detalhes.')
+    await update.message.reply_text('\n'.join(lines))
+
+
+@only_authorized
+async def cmd_urgente(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text('🔍 Buscando urgentes (todos)...')
+    buckets, total, spam, err = fetch_emails(hours=None, only_cat='URGENTE', limit=200)
+    if err:
+        await update.message.reply_text(f'❌ Erro: {err}')
+        return
+    items = buckets.get('URGENTE', [])
+    if not items:
+        await update.message.reply_text('✅ Nenhum urgente.')
+        return
+    # Enviar em blocos se muitos itens
+    header = f'🔴 URGENTE ({len(items)} emails)\n\n'
+    msg = header + '\n'.join(items[:30])
+    await update.message.reply_text(msg)
+    if len(items) > 30:
+        await update.message.reply_text(f'... e mais {len(items)-30} emails urgentes.')
+
+
+@only_authorized
 async def cmd_vendas(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text('🔍 Buscando vendas (48h)...')
-    buckets, err = fetch_emails(hours=48, only_cat='VENDAS')
+    await update.message.reply_text('🔍 Buscando vendas (todos)...')
+    buckets, total, spam, err = fetch_emails(hours=None, only_cat='VENDAS', limit=200)
     if err:
         await update.message.reply_text(f'❌ Erro: {err}')
         return
     items = buckets.get('VENDAS', [])
-    msg = ('💰 VENDAS\n\n' + '\n'.join(items)) if items else '📭 Nenhuma venda recente.'
+    msg = (f'💰 VENDAS ({len(items)})\n\n' + '\n'.join(items[:30])) if items else '📭 Nenhuma venda.'
     await update.message.reply_text(msg)
 
 
 @only_authorized
 async def cmd_profissional(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    buckets, err = fetch_emails(hours=48, only_cat='PROFISSIONAL')
+    buckets, total, spam, err = fetch_emails(hours=None, only_cat='PROFISSIONAL', limit=100)
     if err:
         await update.message.reply_text(f'❌ Erro: {err}')
         return
     items = buckets.get('PROFISSIONAL', [])
-    msg = ('👨‍💼 PROFISSIONAL\n\n' + '\n'.join(items)) if items else '📭 Nenhum email profissional.'
+    msg = (f'👨‍💼 PROFISSIONAL ({len(items)})\n\n' + '\n'.join(items[:30])) if items else '📭 Nenhum.'
     await update.message.reply_text(msg)
 
 
 @only_authorized
 async def cmd_marcar_lido(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text('✅ Marcando todos como lidos...')
-    total = mark_as_read(hours=72)
+    await update.message.reply_text('⏳ Marcando TODOS os emails como lidos (pode demorar para caixas grandes)...')
+    total = mark_as_read(hours=None)
     if total == -1:
         await update.message.reply_text('❌ Erro ao marcar emails.')
     elif total == 0:
-        await update.message.reply_text('📭 Nenhum email não lido para marcar.')
+        await update.message.reply_text('📭 Nenhum email não lido.')
     else:
         await update.message.reply_text(f'✅ {total} email(s) marcados como lidos!')
 
@@ -220,11 +293,12 @@ async def cmd_marcar_lido(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         '🤖 Comandos disponíveis:\n\n'
-        '📬 emails — resumo geral (24h)\n'
-        '🔴 urgente — só os urgentes (48h)\n'
-        '💰 vendas — novas vendas (48h)\n'
+        '📬 emails — resumo geral (últimas 24h)\n'
+        '📊 todos — conta todos os não lidos por categoria\n'
+        '🔴 urgente — urgentes (sem limite de data)\n'
+        '💰 vendas — novas vendas\n'
         '👨‍💼 profissional — jurídico, tributário\n'
-        '✅ marcar lido — marca todos como lidos\n'
+        '✅ marcar lido — marca TODOS como lidos\n'
         '❓ ajuda — esta mensagem\n\n'
         'Pode escrever em texto livre também!'
     )
@@ -234,7 +308,9 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.lower().strip()
 
-    if any(w in text for w in ['email', 'emails', 'ler', 'leia', 'resumo', 'caixa', 'inbox']):
+    if any(w in text for w in ['todos', 'tudo', '1000', 'pendentes', 'quantos', 'fila', 'geral']):
+        await cmd_todos(update, context)
+    elif any(w in text for w in ['email', 'emails', 'ler', 'leia', 'resumo', 'caixa', 'inbox']):
         await cmd_emails(update, context)
     elif any(w in text for w in ['urgente', 'urgentes', 'importante', 'importantes', 'critico']):
         await cmd_urgente(update, context)
@@ -242,19 +318,20 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await cmd_vendas(update, context)
     elif any(w in text for w in ['profissional', 'juridico', 'tributario', 'conjur', 'legisweb']):
         await cmd_profissional(update, context)
-    elif any(w in text for w in ['marcar', 'lido', 'lidos', 'arquivar', 'limpar']):
+    elif any(w in text for w in ['marcar', 'lido', 'lidos', 'arquivar', 'limpar', 'zerar']):
         await cmd_marcar_lido(update, context)
     elif any(w in text for w in ['ajuda', 'help', 'comandos', 'menu']):
         await cmd_help(update, context)
     else:
         await update.message.reply_text(
-            'Não entendi 😅\n\nTente: emails, urgente, vendas, profissional, ajuda'
+            'Não entendi 😅\n\nTente: todos, emails, urgente, vendas, marcar lido, ajuda'
         )
 
 
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
-    app.add_handler(CommandHandler('start', cmd_emails))
+    app.add_handler(CommandHandler('start', cmd_todos))
+    app.add_handler(CommandHandler('todos', cmd_todos))
     app.add_handler(CommandHandler('emails', cmd_emails))
     app.add_handler(CommandHandler('urgente', cmd_urgente))
     app.add_handler(CommandHandler('vendas', cmd_vendas))
