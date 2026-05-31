@@ -2,10 +2,12 @@ import os
 import imaplib
 import email
 import json
+import re
 from email.header import decode_header
 from datetime import datetime, timedelta
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, JobQueue
+import anthropic
 
 TELEGRAM_TOKEN = os.environ['TELEGRAM_TOKEN']
 CHAT_ID = int(os.environ['CHAT_ID'])
@@ -105,6 +107,9 @@ ICONS = {
     'OUTROS': '📌',
 }
 
+ANTHROPIC_API_KEY = os.environ.get('ANTHROPIC_API_KEY', '')
+claude_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY) if ANTHROPIC_API_KEY else None
+
 # Controle de alertas já enviados (evita repetição)
 _alerted_ids = set()
 
@@ -181,6 +186,93 @@ def fetch_headers(mail, ids, limit=200):
         subject = decode_str(msg.get('Subject', '(sem assunto)'))
         results.append((eid, sender, subject))
     return results
+
+
+def get_email_body(msg):
+    """Extrai o texto do corpo do email."""
+    body = ''
+    if msg.is_multipart():
+        for part in msg.walk():
+            ct = part.get_content_type()
+            cd = str(part.get('Content-Disposition', ''))
+            if ct == 'text/plain' and 'attachment' not in cd:
+                try:
+                    body += part.get_payload(decode=True).decode(part.get_content_charset() or 'utf-8', errors='replace')
+                except:
+                    pass
+    else:
+        try:
+            body = msg.get_payload(decode=True).decode(msg.get_content_charset() or 'utf-8', errors='replace')
+        except:
+            body = str(msg.get_payload())
+    return body.strip()[:3000]  # limite para API
+
+
+def search_email_by_name(name_query):
+    """Busca o email mais recente de um remetente pelo nome."""
+    for acc in ACCOUNTS:
+        try:
+            mail = get_imap(acc['user'], acc['password'], readonly=True)
+            _, data = mail.search(None, f'(FROM "{name_query}")')
+            ids = data[0].split()
+            if not ids:
+                # Tenta busca parcial por palavra
+                _, data = mail.search(None, 'ALL')
+                all_ids = data[0].split()
+                # Pega os últimos 200 e filtra por nome
+                for eid in reversed(all_ids[-200:]):
+                    _, msg_data = mail.fetch(eid, '(BODY.PEEK[HEADER.FIELDS (FROM SUBJECT DATE)])')
+                    raw = msg_data[0][1]
+                    msg = email.message_from_bytes(raw)
+                    sender = decode_str(msg.get('From', ''))
+                    if name_query.lower() in sender.lower():
+                        ids = [eid]
+                        break
+            if ids:
+                eid = ids[-1]  # mais recente
+                _, msg_data = mail.fetch(eid, '(BODY.PEEK[])')
+                raw = msg_data[0][1]
+                msg = email.message_from_bytes(raw)
+                sender = decode_str(msg.get('From', ''))
+                subject = decode_str(msg.get('Subject', ''))
+                date = decode_str(msg.get('Date', ''))
+                body = get_email_body(msg)
+                mail.logout()
+                return {'sender': sender, 'subject': subject, 'date': date, 'body': body, 'account': acc['label']}
+            mail.logout()
+        except Exception as e:
+            print(f'Erro search_email_by_name: {e}')
+    return None
+
+
+def analyze_with_claude(email_data):
+    """Envia email para Claude e retorna resumo + plano de ação."""
+    if not claude_client:
+        return '❌ API Claude não configurada.'
+    prompt = f"""Você é um assistente de um contador tributário brasileiro chamado Marcos Lima.
+
+Analise o email abaixo e retorne:
+
+1. RESUMO (máx 3 linhas): do que se trata o email
+2. PLANO DE AÇÃO: lista numerada de ações concretas que Marcos deve tomar, em ordem de prioridade
+3. PRAZO SUGERIDO: quando resolver (se identificável)
+4. QUEM ENVOLVER: se precisar de mais alguém da equipe
+
+Email:
+De: {email_data['sender']}
+Assunto: {email_data['subject']}
+Data: {email_data['date']}
+
+{email_data['body']}
+
+Responda em português, de forma direta e prática. Sem introduções."""
+
+    msg = claude_client.messages.create(
+        model='claude-haiku-4-5-20251001',
+        max_tokens=600,
+        messages=[{'role': 'user', 'content': prompt}]
+    )
+    return msg.content[0].text
 
 
 def fetch_emails_account(acc, hours=None, only_cat=None, limit=100):
@@ -439,6 +531,37 @@ async def cmd_marcar_lido(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 @only_authorized
+async def cmd_analisar_email(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Busca email por nome e retorna análise + plano de ação."""
+    text = update.message.text.strip()
+    # Extrai o nome após palavras-chave
+    for kw in ['email do', 'email da', 'email de', 'analisar email do', 'analisar email da',
+                'analisar email de', 'plano de acao', 'plano de ação', 'o que fazer com']:
+        if kw in text.lower():
+            name_query = text.lower().replace(kw, '').strip().title()
+            break
+    else:
+        name_query = text.strip()
+
+    if not name_query or len(name_query) < 2:
+        await update.message.reply_text('❓ Qual o nome? Ex: "email da Raquel"')
+        return
+
+    await update.message.reply_text(f'🔍 Buscando email de {name_query}...')
+    email_data = search_email_by_name(name_query)
+
+    if not email_data:
+        await update.message.reply_text(f'📭 Nenhum email encontrado de "{name_query}".')
+        return
+
+    await update.message.reply_text(
+        f'📧 Encontrado!\nDe: {email_data["sender"]}\nAssunto: {email_data["subject"]}\n\n⏳ Analisando com IA...'
+    )
+    analysis = analyze_with_claude(email_data)
+    await update.message.reply_text(analysis)
+
+
+@only_authorized
 async def cmd_pessoal_gmail(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Lê somente a conta pessoal cnp.marcoslima@gmail.com"""
     pessoal = next((a for a in ACCOUNTS if 'cnp' in a['user']), None)
@@ -585,6 +708,13 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await cmd_pessoal(update, context)
 
     elif any(w in text for w in [
+        'email do', 'email da', 'email de', 'analisar email',
+        'plano de acao', 'plano de ação', 'o que fazer com',
+        'o que preciso fazer', 'analisa email',
+    ]):
+        await cmd_analisar_email(update, context)
+
+    elif any(w in text for w in [
         'email pessoal', 'emails pessoais', 'cnp', 'gmail pessoal',
         'meu pessoal', 'conta pessoal', 'ler pessoal',
     ]):
@@ -648,6 +778,7 @@ def main():
     app.add_handler(CommandHandler('profissional', cmd_profissional))
     app.add_handler(CommandHandler('financeiro', cmd_financeiro))
     app.add_handler(CommandHandler('pessoal', cmd_pessoal))
+    app.add_handler(CommandHandler('analisar', cmd_analisar_email))
     app.add_handler(CommandHandler('cnp', cmd_pessoal_gmail))
     app.add_handler(CommandHandler('varredura', cmd_varredura))
     app.add_handler(CommandHandler('alertas', cmd_alertas))
