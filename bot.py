@@ -9,8 +9,25 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 
 TELEGRAM_TOKEN = os.environ['TELEGRAM_TOKEN']
 CHAT_ID = int(os.environ['CHAT_ID'])
-GMAIL_USER = os.environ['GMAIL_USER']
-GMAIL_APP_PASSWORD = os.environ['GMAIL_APP_PASSWORD']
+
+# Contas monitoradas
+ACCOUNTS = [
+    {
+        'user': os.environ['GMAIL_USER'],
+        'password': os.environ['GMAIL_APP_PASSWORD'],
+        'label': '💼 Trabalho',
+    },
+    {
+        'user': os.environ.get('GMAIL_USER_2', ''),
+        'password': os.environ.get('GMAIL_APP_PASSWORD_2', ''),
+        'label': '👤 Pessoal',
+    },
+]
+ACCOUNTS = [a for a in ACCOUNTS if a['user'] and a['password']]
+
+# Compat: manter GMAIL_USER/GMAIL_APP_PASSWORD apontando para a primeira conta
+GMAIL_USER = ACCOUNTS[0]['user']
+GMAIL_APP_PASSWORD = ACCOUNTS[0]['password']
 
 # ─── ALERTAS IMEDIATOS ────────────────────────────────────────────────────────
 # Palavras que disparam 🚨 ALERTA na hora, independente do horário
@@ -136,9 +153,11 @@ def match_alert(sender, subject):
     return None
 
 
-def get_imap(readonly=True):
+def get_imap(user=None, password=None, readonly=True):
+    user = user or GMAIL_USER
+    password = password or GMAIL_APP_PASSWORD
     mail = imaplib.IMAP4_SSL('imap.gmail.com')
-    mail.login(GMAIL_USER, GMAIL_APP_PASSWORD)
+    mail.login(user, password)
     mail.select('inbox', readonly=readonly)
     return mail
 
@@ -164,58 +183,79 @@ def fetch_headers(mail, ids, limit=200):
     return results
 
 
+def fetch_emails_account(acc, hours=None, only_cat=None, limit=100):
+    mail = get_imap(acc['user'], acc['password'], readonly=True)
+    ids = search_unseen(mail, hours)
+    total_unseen = len(ids)
+    buckets = {k: [] for k in ICONS}
+    spam_count = 0
+    for eid, sender, subject in fetch_headers(mail, ids, limit):
+        if is_spam(sender, subject):
+            spam_count += 1
+            continue
+        cat = classify(sender, subject)
+        if only_cat and cat != only_cat:
+            continue
+        name = sender.split('<')[0].strip().strip('"') or sender
+        name = name[:35] + '...' if len(name) > 35 else name
+        sub = subject[:55] + '...' if len(subject) > 55 else subject
+        buckets[cat].append(f'• {sub}\n  ↳ {name}')
+    mail.logout()
+    return buckets, total_unseen, spam_count
+
+
 def fetch_emails(hours=None, only_cat=None, limit=100):
     try:
-        mail = get_imap(readonly=True)
-        ids = search_unseen(mail, hours)
-        total_unseen = len(ids)
-        buckets = {k: [] for k in ICONS}
-        spam_count = 0
-        for eid, sender, subject in fetch_headers(mail, ids, limit):
-            if is_spam(sender, subject):
-                spam_count += 1
-                continue
-            cat = classify(sender, subject)
-            if only_cat and cat != only_cat:
-                continue
-            name = sender.split('<')[0].strip().strip('"') or sender
-            name = name[:35] + '...' if len(name) > 35 else name
-            sub = subject[:55] + '...' if len(subject) > 55 else subject
-            buckets[cat].append(f'• {sub}\n  ↳ {name}')
-        mail.logout()
-        return buckets, total_unseen, spam_count, None
+        merged = {k: [] for k in ICONS}
+        total_all, spam_all = 0, 0
+        for acc in ACCOUNTS:
+            buckets, total, spam = fetch_emails_account(acc, hours, only_cat, limit)
+            total_all += total
+            spam_all += spam
+            for cat in ICONS:
+                # Prefixar com label da conta se mais de uma conta
+                if len(ACCOUNTS) > 1:
+                    merged[cat].extend([f'[{acc["label"]}] {item}' for item in buckets[cat]])
+                else:
+                    merged[cat].extend(buckets[cat])
+        return merged, total_all, spam_all, None
     except Exception as e:
         return None, 0, 0, str(e)
 
 
 def count_by_category(hours=None, limit=500):
     try:
-        mail = get_imap(readonly=True)
-        ids = search_unseen(mail, hours)
-        total = len(ids)
-        counts = {k: 0 for k in ICONS}
-        spam = 0
-        for eid, sender, subject in fetch_headers(mail, ids, limit):
-            if is_spam(sender, subject):
-                spam += 1
-                continue
-            counts[classify(sender, subject)] += 1
-        mail.logout()
-        return total, counts, spam, None
+        total_all = 0
+        counts_all = {k: 0 for k in ICONS}
+        spam_all = 0
+        for acc in ACCOUNTS:
+            mail = get_imap(acc['user'], acc['password'], readonly=True)
+            ids = search_unseen(mail, hours)
+            total_all += len(ids)
+            for eid, sender, subject in fetch_headers(mail, ids, limit):
+                if is_spam(sender, subject):
+                    spam_all += 1
+                    continue
+                counts_all[classify(sender, subject)] += 1
+            mail.logout()
+        return total_all, counts_all, spam_all, None
     except Exception as e:
         return 0, {}, 0, str(e)
 
 
 def mark_as_read(hours=None):
     try:
-        mail = get_imap(readonly=False)
-        ids = search_unseen(mail, hours)
-        if ids:
-            for i in range(0, len(ids), 100):
-                batch = ids[i:i+100]
-                mail.store(b','.join(batch), '+FLAGS', '\\Seen')
-        mail.logout()
-        return len(ids)
+        total = 0
+        for acc in ACCOUNTS:
+            mail = get_imap(acc['user'], acc['password'], readonly=False)
+            ids = search_unseen(mail, hours)
+            if ids:
+                for i in range(0, len(ids), 100):
+                    batch = ids[i:i+100]
+                    mail.store(b','.join(batch), '+FLAGS', '\\Seen')
+            total += len(ids)
+            mail.logout()
+        return total
     except Exception as e:
         return -1
 
@@ -239,37 +279,35 @@ def build_message(buckets, title='📬 Emails não lidos'):
 async def check_alerts(context):
     """Roda em background — dispara alerta se email contiver palavra-chave crítica."""
     global _alerted_ids
-    try:
-        mail = get_imap(readonly=True)
-        # Checar só os últimos 30 min para alertas rápidos
-        since = (datetime.now() - timedelta(minutes=35)).strftime('%d-%b-%Y')
-        _, data = mail.search(None, f'(UNSEEN SINCE {since})')
-        ids = data[0].split()
-
-        alerts = []
-        for eid, sender, subject in fetch_headers(mail, ids, limit=50):
-            if eid in _alerted_ids:
-                continue
-            kw = match_alert(sender, subject)
-            if kw:
-                name = sender.split('<')[0].strip().strip('"') or sender
-                alerts.append((eid, name, subject, kw))
-
-        mail.logout()
-
-        for eid, name, subject, kw in alerts:
-            _alerted_ids.add(eid)
-            hora = datetime.now().strftime('%H:%M')
-            msg = (
-                f'🚨 ALERTA — {hora}\n\n'
-                f'Palavra-chave detectada: {kw.upper()}\n\n'
-                f'📧 {subject}\n'
-                f'↳ {name}'
-            )
-            await context.bot.send_message(chat_id=CHAT_ID, text=msg)
-
-    except Exception as e:
-        print(f'Erro no check_alerts: {e}')
+    for acc in ACCOUNTS:
+        try:
+            mail = get_imap(acc['user'], acc['password'], readonly=True)
+            since = (datetime.now() - timedelta(minutes=35)).strftime('%d-%b-%Y')
+            _, data = mail.search(None, f'(UNSEEN SINCE {since})')
+            ids = data[0].split()
+            alerts = []
+            for eid, sender, subject in fetch_headers(mail, ids, limit=50):
+                uid = f"{acc['user']}:{eid}"
+                if uid in _alerted_ids:
+                    continue
+                kw = match_alert(sender, subject)
+                if kw:
+                    name = sender.split('<')[0].strip().strip('"') or sender
+                    alerts.append((uid, name, subject, kw))
+            mail.logout()
+            for uid, name, subject, kw in alerts:
+                _alerted_ids.add(uid)
+                hora = datetime.now().strftime('%H:%M')
+                msg = (
+                    f'🚨 ALERTA — {hora}\n'
+                    f'{acc["label"]}\n\n'
+                    f'Palavra-chave: {kw.upper()}\n\n'
+                    f'📧 {subject}\n'
+                    f'↳ {name}'
+                )
+                await context.bot.send_message(chat_id=CHAT_ID, text=msg)
+        except Exception as e:
+            print(f'Erro check_alerts {acc["user"]}: {e}')
 
 
 # ─── HANDLERS ────────────────────────────────────────────────────────────────
@@ -404,18 +442,20 @@ async def cmd_marcar_lido(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_varredura(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text('🔍 Varrendo caixa de entrada...')
     try:
-        mail = get_imap(readonly=True)
-        ids = search_unseen(mail, hours=None)
-        total = len(ids)
+        total = 0
         encontrados = []
-        for eid, sender, subject in fetch_headers(mail, ids, limit=500):
-            kw = match_alert(sender, subject)
-            if kw:
-                name = sender.split('<')[0].strip().strip('"') or sender
-                name = name[:35] + '...' if len(name) > 35 else name
-                sub = subject[:55] + '...' if len(subject) > 55 else subject
-                encontrados.append((kw, sub, name))
-        mail.logout()
+        for acc in ACCOUNTS:
+            mail = get_imap(acc['user'], acc['password'], readonly=True)
+            ids = search_unseen(mail, hours=None)
+            total += len(ids)
+            for eid, sender, subject in fetch_headers(mail, ids, limit=500):
+                kw = match_alert(sender, subject)
+                if kw:
+                    name = sender.split('<')[0].strip().strip('"') or sender
+                    name = name[:35] + '...' if len(name) > 35 else name
+                    sub = subject[:55] + '...' if len(subject) > 55 else subject
+                    encontrados.append((kw, sub, name, acc['label']))
+            mail.logout()
 
         if not encontrados:
             await update.message.reply_text(
@@ -425,8 +465,8 @@ async def cmd_varredura(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         lines = [f'🚨 VARREDURA — {len(encontrados)} alertas em {total} emails\n']
-        for kw, sub, name in encontrados[:30]:
-            lines.append(f'⚡ [{kw.upper()}]\n• {sub}\n  ↳ {name}\n')
+        for kw, sub, name, label in encontrados[:30]:
+            lines.append(f'⚡ [{kw.upper()}] {label}\n• {sub}\n  ↳ {name}\n')
         msg = '\n'.join(lines)
         await update.message.reply_text(msg)
         if len(encontrados) > 30:
