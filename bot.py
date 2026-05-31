@@ -25,12 +25,13 @@ SPAM_SUBJECTS = [
 URGENT_SENDERS = [
     'atendimento@compliance-ce.com.br', 'pgfn.gov.br', 'qive.com.br',
     'sigmavaf.com.br', 'accounts.google.com', 'adveronix.com',
-    'regularize', 'receita.fazenda',
+    'regularize', 'receita.fazenda', 'flex-wind.com', 'tailscale',
 ]
 URGENT_SUBJECTS = [
     'gestta', 'vencer', 'certificado', 'regularize', 'seguranca',
     'segurança', 'prefeitura', 'pgfn', 'multa', 'vencimento',
-    'prazo', 'pendencia', 'pendência',
+    'prazo', 'pendencia', 'pendência', 'provisao', 'provisão',
+    'reversao', 'reversão', 'trial ends',
 ]
 SALES_SENDERS = ['eduzz.com', 'hotmart.com']
 PROFESSIONAL_SENDERS = [
@@ -134,6 +135,22 @@ def build_message(buckets, title='📬 Emails não lidos'):
     return '\n'.join(lines).strip()
 
 
+def mark_as_read(hours=24):
+    try:
+        mail = imaplib.IMAP4_SSL('imap.gmail.com')
+        mail.login(GMAIL_USER, GMAIL_APP_PASSWORD)
+        mail.select('inbox', readonly=False)
+        since = (datetime.now() - timedelta(hours=hours)).strftime('%d-%b-%Y')
+        _, data = mail.search(None, f'(UNSEEN SINCE {since})')
+        ids = data[0].split()
+        if ids:
+            mail.store(b','.join(ids), '+FLAGS', '\\Seen')
+        mail.logout()
+        return len(ids)
+    except Exception as e:
+        return -1
+
+
 def only_authorized(func):
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if update.effective_chat.id != CHAT_ID:
@@ -188,6 +205,18 @@ async def cmd_profissional(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 @only_authorized
+async def cmd_marcar_lido(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text('✅ Marcando todos como lidos...')
+    total = mark_as_read(hours=72)
+    if total == -1:
+        await update.message.reply_text('❌ Erro ao marcar emails.')
+    elif total == 0:
+        await update.message.reply_text('📭 Nenhum email não lido para marcar.')
+    else:
+        await update.message.reply_text(f'✅ {total} email(s) marcados como lidos!')
+
+
+@only_authorized
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         '🤖 Comandos disponíveis:\n\n'
@@ -195,6 +224,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         '🔴 urgente — só os urgentes (48h)\n'
         '💰 vendas — novas vendas (48h)\n'
         '👨‍💼 profissional — jurídico, tributário\n'
+        '✅ marcar lido — marca todos como lidos\n'
         '❓ ajuda — esta mensagem\n\n'
         'Pode escrever em texto livre também!'
     )
@@ -212,6 +242,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await cmd_vendas(update, context)
     elif any(w in text for w in ['profissional', 'juridico', 'tributario', 'conjur', 'legisweb']):
         await cmd_profissional(update, context)
+    elif any(w in text for w in ['marcar', 'lido', 'lidos', 'arquivar', 'limpar']):
+        await cmd_marcar_lido(update, context)
     elif any(w in text for w in ['ajuda', 'help', 'comandos', 'menu']):
         await cmd_help(update, context)
     else:
@@ -227,6 +259,7 @@ def main():
     app.add_handler(CommandHandler('urgente', cmd_urgente))
     app.add_handler(CommandHandler('vendas', cmd_vendas))
     app.add_handler(CommandHandler('profissional', cmd_profissional))
+    app.add_handler(CommandHandler('marcar', cmd_marcar_lido))
     app.add_handler(CommandHandler('ajuda', cmd_help))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     print('Bot rodando...')
