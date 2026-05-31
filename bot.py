@@ -3,7 +3,11 @@ import imaplib
 import email
 import json
 import re
+import smtplib
 from email.header import decode_header
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from email.mime.base import MIMEBase
 from datetime import datetime, timedelta
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, JobQueue
@@ -110,6 +114,25 @@ ICONS = {
 ANTHROPIC_API_KEY = os.environ.get('ANTHROPIC_API_KEY', '')
 claude_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY) if ANTHROPIC_API_KEY else None
 
+# ─── REGRAS AUTOMÁTICAS ───────────────────────────────────────────────────────
+# Quando email bate numa regra: alerta Telegram + encaminha automaticamente
+
+RULES = [
+    {
+        'name': 'IPOG — Solicitação de NF',
+        'match_from': ['nf@ipog.edu.br', 'ipog.edu.br'],
+        'match_subject': ['solicitação nf', 'solicitacao nf', 'nota fiscal', 'nf semana'],
+        'forward_to': ['vanessa2mlima@gmail.com', 'vanessalima@compliance-ce.com.br'],
+        'forward_from_account': 'cnp',   # qual conta encaminhar (cnp = pessoal)
+        'alert_msg': '🚨 IPOG — Solicitação de NF recebida!\nEncaminhado para Vanessa automaticamente.',
+        'priority': 'URGENTE',
+    },
+    # Adicione mais regras aqui no futuro
+]
+
+# Controle de IDs já processados por regras (evita repetição)
+_rule_processed_ids = set()
+
 # Controle de alertas já enviados (evita repetição)
 _alerted_ids = set()
 
@@ -186,6 +209,55 @@ def fetch_headers(mail, ids, limit=200):
         subject = decode_str(msg.get('Subject', '(sem assunto)'))
         results.append((eid, sender, subject))
     return results
+
+
+def match_rule(sender, subject):
+    """Retorna a regra que bate com o email, ou None."""
+    s, sub = sender.lower(), subject.lower()
+    for rule in RULES:
+        from_match = any(x in s for x in rule['match_from'])
+        subj_match = any(x in sub for x in rule['match_subject'])
+        if from_match or subj_match:
+            return rule
+    return None
+
+
+def forward_email(original_msg_bytes, rule, acc):
+    """Encaminha o email via SMTP usando a conta configurada na regra."""
+    try:
+        # Seleciona a conta de envio
+        send_acc = next(
+            (a for a in ACCOUNTS if rule['forward_from_account'] in a['user']),
+            ACCOUNTS[0]
+        )
+        # Monta email de encaminhamento
+        original = email.message_from_bytes(original_msg_bytes)
+        orig_from = decode_str(original.get('From', ''))
+        orig_subject = decode_str(original.get('Subject', ''))
+        orig_date = decode_str(original.get('Date', ''))
+        orig_body = get_email_body(original)
+
+        fwd = MIMEMultipart()
+        fwd['From'] = send_acc['user']
+        fwd['To'] = ', '.join(rule['forward_to'])
+        fwd['Subject'] = f'Fwd: {orig_subject}'
+
+        body = (
+            f'-------- Mensagem encaminhada --------\n'
+            f'De: {orig_from}\n'
+            f'Data: {orig_date}\n'
+            f'Assunto: {orig_subject}\n\n'
+            f'{orig_body}'
+        )
+        fwd.attach(MIMEText(body, 'plain', 'utf-8'))
+
+        with smtplib.SMTP_SSL('smtp.gmail.com', 465) as smtp:
+            smtp.login(send_acc['user'], send_acc['password'])
+            smtp.sendmail(send_acc['user'], rule['forward_to'], fwd.as_bytes())
+        return True
+    except Exception as e:
+        print(f'Erro ao encaminhar email: {e}')
+        return False
 
 
 def get_email_body(msg):
@@ -369,35 +441,63 @@ def build_message(buckets, title='📬 Emails não lidos'):
 # ─── MONITORAMENTO AUTOMÁTICO (a cada 10 min) ─────────────────────────────────
 
 async def check_alerts(context):
-    """Roda em background — dispara alerta se email contiver palavra-chave crítica."""
-    global _alerted_ids
+    """Roda em background — verifica alertas e regras automáticas."""
+    global _alerted_ids, _rule_processed_ids
     for acc in ACCOUNTS:
         try:
             mail = get_imap(acc['user'], acc['password'], readonly=True)
             since = (datetime.now() - timedelta(minutes=35)).strftime('%d-%b-%Y')
             _, data = mail.search(None, f'(UNSEEN SINCE {since})')
             ids = data[0].split()
-            alerts = []
-            for eid, sender, subject in fetch_headers(mail, ids, limit=50):
+
+            for eid in ids[-50:]:
                 uid = f"{acc['user']}:{eid}"
-                if uid in _alerted_ids:
-                    continue
-                kw = match_alert(sender, subject)
-                if kw:
-                    name = sender.split('<')[0].strip().strip('"') or sender
-                    alerts.append((uid, name, subject, kw))
+
+                # Busca headers
+                _, msg_data = mail.fetch(eid, '(BODY.PEEK[HEADER.FIELDS (FROM SUBJECT)])')
+                raw = msg_data[0][1]
+                msg = email.message_from_bytes(raw)
+                sender = decode_str(msg.get('From', ''))
+                subject = decode_str(msg.get('Subject', ''))
+
+                # ── Verificar REGRAS automáticas ──
+                rule = match_rule(sender, subject)
+                if rule and uid not in _rule_processed_ids:
+                    _rule_processed_ids.add(uid)
+                    # Busca email completo para encaminhar
+                    _, full_data = mail.fetch(eid, '(BODY.PEEK[])')
+                    full_raw = full_data[0][1]
+                    ok = forward_email(full_raw, rule, acc)
+                    hora = datetime.now().strftime('%H:%M')
+                    status = '✅ Encaminhado' if ok else '❌ Falha ao encaminhar'
+                    destinos = '\n'.join(f'  • {d}' for d in rule['forward_to'])
+                    msg_tg = (
+                        f'{rule["alert_msg"]}\n\n'
+                        f'📧 {subject}\n'
+                        f'↳ {sender}\n'
+                        f'🕐 {hora}\n\n'
+                        f'{status} para:\n{destinos}'
+                    )
+                    await context.bot.send_message(chat_id=CHAT_ID, text=msg_tg)
+                    continue  # já tratado pela regra
+
+                # ── Verificar ALERTAS por palavra-chave ──
+                if uid not in _alerted_ids:
+                    kw = match_alert(sender, subject)
+                    if kw:
+                        _alerted_ids.add(uid)
+                        name = sender.split('<')[0].strip().strip('"') or sender
+                        hora = datetime.now().strftime('%H:%M')
+                        msg_tg = (
+                            f'🚨 ALERTA — {hora}\n'
+                            f'{acc["label"]}\n\n'
+                            f'Palavra-chave: {kw.upper()}\n\n'
+                            f'📧 {subject}\n'
+                            f'↳ {name}'
+                        )
+                        await context.bot.send_message(chat_id=CHAT_ID, text=msg_tg)
+
             mail.logout()
-            for uid, name, subject, kw in alerts:
-                _alerted_ids.add(uid)
-                hora = datetime.now().strftime('%H:%M')
-                msg = (
-                    f'🚨 ALERTA — {hora}\n'
-                    f'{acc["label"]}\n\n'
-                    f'Palavra-chave: {kw.upper()}\n\n'
-                    f'📧 {subject}\n'
-                    f'↳ {name}'
-                )
-                await context.bot.send_message(chat_id=CHAT_ID, text=msg)
         except Exception as e:
             print(f'Erro check_alerts {acc["user"]}: {e}')
 
