@@ -139,6 +139,36 @@ _rule_processed_ids = set()
 # Controle de alertas já enviados (evita repetição)
 _alerted_ids = set()
 
+# Controle de solicitações de parecer pendentes: uid -> email_data
+_parecer_pending = {}
+
+# ─── DETECÇÃO DE SOLICITAÇÕES DE PARECER ─────────────────────────────────────
+# Palavras no ASSUNTO que sugerem consulta tributária/fiscal
+PARECER_SUBJECT_KEYWORDS = [
+    'fiscal', 'tributar', 'análise', 'analise', 'orientação', 'orientacao',
+    'consulta', 'regime', 'cnae', 'icms', 'pis', 'cofins', 'posicionamento',
+    'parecer', 'estrutura', 'enquadramento', 'filial', 'cnpj', 'nfc-e',
+]
+
+# Frases no CORPO que confirmam pedido de análise/orientação
+PARECER_BODY_KEYWORDS = [
+    'análise e orientação', 'analise e orientacao',
+    'orientação sobre', 'orientacao sobre',
+    'gostaríamos de receber', 'gostariamos de receber',
+    'ficamos no seu aguardo', 'aguardamos seu retorno',
+    'aguardo seu posicionamento', 'pedimos orientação', 'pedimos orientacao',
+    'solicito orientação', 'solicito orientacao', 'solicito parecer',
+    'posicionamento técnico', 'posicionamento tecnico',
+    'necessidade de abertura', 'novo cnpj', 'nova filial',
+    'adequação do regime', 'adequacao do regime',
+    'regime tributário adequado', 'impacto tributário', 'impacto tributario',
+    'detalhamento do projeto para análise', 'detalhamento do projeto para analise',
+    'orientação técnica', 'orientacao tecnica',
+    'parte fiscal', 'análise fiscal', 'analise fiscal',
+    'estrutura tributária', 'estrutura tributaria',
+    'icms-st', 'cnae adequado', 'obrigações tributárias', 'obrigacoes tributarias',
+]
+
 
 # ─── HELPERS ─────────────────────────────────────────────────────────────────
 
@@ -320,6 +350,147 @@ def search_email_by_name(name_query):
     return None
 
 
+def match_parecer_subject(subject):
+    """Retorna True se o assunto sugere uma consulta tributária."""
+    sub = subject.lower()
+    return any(kw in sub for kw in PARECER_SUBJECT_KEYWORDS)
+
+
+def match_parecer_body(body):
+    """Retorna True se o corpo confirma pedido de orientação/análise."""
+    b = body.lower()
+    return any(kw in b for kw in PARECER_BODY_KEYWORDS)
+
+
+def extract_empresa_cnpj(text):
+    """Extrai nome da empresa e CNPJ do corpo do email."""
+    empresa = None
+    cnpj = None
+
+    m = re.search(r'\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2}', text)
+    if m:
+        cnpj = m.group()
+
+    patterns = [
+        r'empresa\s+([A-ZÀ-Úa-zà-ú][^\(,\n]{2,40}?)(?:\s*[\(,]|\s+CNPJ|\s+\(CNPJ)',
+        r'([A-ZÀ-Ú][A-ZÀ-Úa-zà-ú\s]{2,30})\s*\(CNPJ',
+        r'cliente\s+([A-ZÀ-Úa-zà-ú][^\(,\n]{2,40}?)(?:\s*[\(,])',
+    ]
+    for pat in patterns:
+        m2 = re.search(pat, text, re.IGNORECASE)
+        if m2:
+            empresa = m2.group(1).strip().rstrip('.,')
+            break
+
+    return empresa, cnpj
+
+
+def generate_parecer_claude(email_data):
+    """Gera parecer preliminar via Claude Sonnet seguindo as 10 seções da Compliance."""
+    if not claude_client:
+        return None
+    empresa = email_data.get('empresa', 'Cliente')
+    cnpj = email_data.get('cnpj', '')
+    hoje = datetime.now().strftime('%d/%m/%Y')
+
+    prompt = f"""Você é Marcos Lima, contador tributário da Compliance-CE.
+
+Analise o email abaixo e elabore um PARECER TÉCNICO PRELIMINAR seguindo exatamente as 10 seções:
+
+1. CABEÇALHO
+   Data: {hoje} | Empresa: {empresa} | CNPJ: {cnpj}
+   Solicitante: {email_data['sender']} | Parecerista: Marcos Lima
+
+2. QUESTIONAMENTO
+   Contexte a consulta, as dúvidas levantadas e a base legal citada pelo cliente.
+
+3. BASE LEGAL ATUALIZADA
+   Liste artigos, incisos e alíneas aplicáveis. Formato: "LC 214/2025, art. 27, § 3º, inciso II, alínea a"
+
+4. INTERPRETAÇÃO NORMATIVA
+   Análise técnica da norma, hermenêutica jurídico-contábil, posicionamento doutrinário quando relevante.
+
+5. IMPLICAÇÕES PRÁTICAS
+   Consequências concretas para o contribuinte: impacto fiscal, operacional e contábil.
+
+6. ORIENTAÇÕES OPERACIONAIS
+   O que o cliente deve fazer: prazos, procedimentos, ajustes em sistemas e documentos.
+
+7. VEDAÇÕES OU EXCEÇÕES
+   Restrições legais, exceções à regra geral, riscos de autuação fiscal.
+
+8. CITAÇÕES COMPLEMENTARES
+   Jurisprudência (STJ, TRFs, CARF), Soluções de Consulta RFB, manifestações SEFAZ, doutrina.
+
+9. CONCLUSÃO
+   Síntese objetiva — resposta direta a cada pergunta do cliente.
+
+10. ASSINATURA TÉCNICA
+    Marcos Lima — CRC/CE | Data: {hoje}
+    ⚠️ PARECER PRELIMINAR — sujeito a revisão antes da entrega ao cliente.
+
+---
+Email recebido:
+De: {email_data['sender']}
+Assunto: {email_data['subject']}
+
+{email_data['body']}
+---
+
+Responda em português, com linguagem técnica tributária. Cite a legislação de forma completa e precisa."""
+
+    msg = claude_client.messages.create(
+        model='claude-sonnet-4-6',
+        max_tokens=4000,
+        messages=[{'role': 'user', 'content': prompt}]
+    )
+    return msg.content[0].text
+
+
+def save_to_drive(content, empresa, cnpj=None):
+    """Salva o parecer no Google Drive em Empresas/{empresa}/. Requer GOOGLE_SERVICE_ACCOUNT_JSON e DRIVE_EMPRESAS_FOLDER_ID."""
+    sa_json = os.environ.get('GOOGLE_SERVICE_ACCOUNT_JSON', '')
+    folder_id = os.environ.get('DRIVE_EMPRESAS_FOLDER_ID', '')
+    if not sa_json or not folder_id:
+        return None
+    try:
+        import json as _json
+        import io as _io
+        from google.oauth2 import service_account
+        from googleapiclient.discovery import build
+        from googleapiclient.http import MediaIoBaseUpload
+
+        creds = service_account.Credentials.from_service_account_info(
+            _json.loads(sa_json),
+            scopes=['https://www.googleapis.com/auth/drive']
+        )
+        service = build('drive', 'v3', credentials=creds)
+
+        empresa_clean = re.sub(r'[^\w\s\-]', '', empresa).strip()[:50]
+
+        results = service.files().list(
+            q=f"name='{empresa_clean}' and '{folder_id}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false",
+            fields='files(id)'
+        ).execute()
+        files = results.get('files', [])
+        if files:
+            subfolder_id = files[0]['id']
+        else:
+            meta = {'name': empresa_clean, 'mimeType': 'application/vnd.google-apps.folder', 'parents': [folder_id]}
+            f = service.files().create(body=meta, fields='id').execute()
+            subfolder_id = f['id']
+
+        ts = datetime.now().strftime('%Y%m%d_%H%M')
+        filename = f'PARECER_PRELIMINAR_{empresa_clean}_{ts}.txt'
+        media = MediaIoBaseUpload(_io.BytesIO(content.encode('utf-8')), mimetype='text/plain')
+        file_meta = {'name': filename, 'parents': [subfolder_id]}
+        created = service.files().create(body=file_meta, media_body=media, fields='id,webViewLink').execute()
+        return created.get('webViewLink')
+    except Exception as e:
+        print(f'Erro save_to_drive: {e}')
+        return None
+
+
 def analyze_with_claude(email_data):
     """Envia email para Claude e retorna resumo + plano de ação."""
     if not claude_client:
@@ -483,6 +654,46 @@ async def check_alerts(context):
                     )
                     await context.bot.send_message(chat_id=CHAT_ID, text=msg_tg)
                     continue  # já tratado pela regra
+
+                # ── Verificar SOLICITAÇÕES DE PARECER ──
+                if uid not in _alerted_ids and match_parecer_subject(subject):
+                    # Busca corpo para confirmação e extração de empresa
+                    try:
+                        _, full_data = mail.fetch(eid, '(BODY.PEEK[])')
+                        full_raw = full_data[0][1]
+                        full_msg = email.message_from_bytes(full_raw)
+                        body = get_email_body(full_msg)
+                        date_str = decode_str(full_msg.get('Date', ''))
+
+                        if match_parecer_body(body):
+                            _alerted_ids.add(uid)
+                            empresa, cnpj = extract_empresa_cnpj(body)
+                            name = sender.split('<')[0].strip().strip('"') or sender
+                            hora = datetime.now().strftime('%H:%M')
+
+                            _parecer_pending[uid] = {
+                                'sender': sender,
+                                'subject': subject,
+                                'body': body,
+                                'date': date_str,
+                                'empresa': empresa or 'Cliente',
+                                'cnpj': cnpj or '',
+                                'account': acc['label'],
+                            }
+
+                            empresa_info = f'\n🏢 Empresa: {empresa}' if empresa else ''
+                            cnpj_info = f'\n📋 CNPJ: {cnpj}' if cnpj else ''
+                            msg_tg = (
+                                f'📝 SOLICITAÇÃO DE PARECER — {hora}\n'
+                                f'{acc["label"]}{empresa_info}{cnpj_info}\n\n'
+                                f'📧 {subject}\n'
+                                f'↳ {name}\n\n'
+                                f'💡 Responda "parecer" para gerar o parecer preliminar'
+                            )
+                            await context.bot.send_message(chat_id=CHAT_ID, text=msg_tg)
+                            continue
+                    except Exception as e:
+                        print(f'Erro ao verificar parecer {uid}: {e}')
 
                 # ── Verificar ALERTAS por palavra-chave ──
                 if uid not in _alerted_ids:
@@ -665,6 +876,64 @@ async def cmd_analisar_email(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 @only_authorized
+async def cmd_gerar_parecer(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Gera parecer preliminar com base no último email de consulta pendente."""
+    if not _parecer_pending:
+        await update.message.reply_text('📭 Nenhuma solicitação de parecer pendente.\n\nO bot detecta automaticamente emails pedindo orientação/análise tributária.')
+        return
+
+    uid, email_data = list(_parecer_pending.items())[-1]
+    empresa = email_data.get('empresa', 'Cliente')
+    cnpj = email_data.get('cnpj', '')
+
+    await update.message.reply_text(
+        f'⏳ Gerando parecer preliminar...\n'
+        f'🏢 Empresa: {empresa}\n'
+        f'📋 CNPJ: {cnpj}\n\n'
+        f'Aguarde até 30 segundos.'
+    )
+
+    parecer = generate_parecer_claude(email_data)
+    if not parecer:
+        await update.message.reply_text('❌ Erro ao gerar parecer. Verifique a variável ANTHROPIC_API_KEY.')
+        return
+
+    _parecer_pending.pop(uid, None)
+
+    header = (
+        f'📋 PARECER TÉCNICO PRELIMINAR\n'
+        f'🏢 {empresa}'
+        + (f' | CNPJ: {cnpj}' if cnpj else '') +
+        f'\n⚠️ RASCUNHO — revisar antes de entregar ao cliente\n'
+        f'{"─" * 40}\n\n'
+    )
+    full_text = header + parecer
+
+    # Envia em partes no Telegram
+    chunks = [full_text[i:i+4000] for i in range(0, len(full_text), 4000)]
+    for chunk in chunks:
+        await update.message.reply_text(chunk)
+
+    # Tenta salvar no Google Drive
+    link = save_to_drive(full_text, empresa, cnpj)
+    if link:
+        await update.message.reply_text(f'✅ Salvo no Google Drive:\n{link}')
+    else:
+        # Envia como arquivo .txt no Telegram
+        import io
+        from telegram import InputFile
+        ts = datetime.now().strftime('%Y%m%d_%H%M')
+        empresa_clean = re.sub(r'[^\w\s\-]', '', empresa).strip()[:40]
+        filename = f'PARECER_{empresa_clean}_{ts}.txt'
+        file_bytes = io.BytesIO(full_text.encode('utf-8'))
+        await context.bot.send_document(
+            chat_id=CHAT_ID,
+            document=InputFile(file_bytes, filename=filename),
+            caption=f'📄 {filename}'
+        )
+
+
+@only_authorized
 async def cmd_pessoal_gmail(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Lê somente a conta pessoal cnp.marcoslima@gmail.com"""
     pessoal = next((a for a in ACCOUNTS if 'cnp' in a['user']), None)
@@ -752,7 +1021,11 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         '🚨 "ver alertas" — palavras monitoradas\n'
         '✅ "zera a caixa" — marca tudo como lido\n\n'
         '🔔 Monitoramento automático ativo a cada 10 min!\n'
-        'Alertas disparam para: clientes, SPED, PGFN, etc.'
+        'Alertas disparam para: clientes, SPED, PGFN, etc.\n\n'
+        '📝 PARECERES:\n'
+        'Quando chegar email pedindo orientação/análise tributária,\n'
+        'o bot avisa automaticamente. Responda "parecer" para gerar\n'
+        'o parecer preliminar com as 10 seções da Compliance.'
     )
 
 
@@ -809,6 +1082,12 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         'pessoal', 'davi', 'escola', 'familia', 'família', 'colmaster', 'nota', 'filho',
     ]):
         await cmd_pessoal(update, context)
+
+    elif any(w in text for w in [
+        'parecer', 'gerar parecer', 'quero parecer', 'faz o parecer',
+        'elaborar parecer', 'monta o parecer', 'gera o parecer',
+    ]):
+        await cmd_gerar_parecer(update, context)
 
     elif any(w in text for w in [
         'email do', 'email da', 'email de', 'analisar email',
@@ -882,6 +1161,7 @@ def main():
     app.add_handler(CommandHandler('financeiro', cmd_financeiro))
     app.add_handler(CommandHandler('pessoal', cmd_pessoal))
     app.add_handler(CommandHandler('analisar', cmd_analisar_email))
+    app.add_handler(CommandHandler('parecer', cmd_gerar_parecer))
     app.add_handler(CommandHandler('cnp', cmd_pessoal_gmail))
     app.add_handler(CommandHandler('varredura', cmd_varredura))
     app.add_handler(CommandHandler('alertas', cmd_alertas))
