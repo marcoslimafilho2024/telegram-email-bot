@@ -117,6 +117,96 @@ ICONS = {
     'OUTROS': '📌',
 }
 
+# ─── CLAUDE AGENT — TOOL USE ──────────────────────────────────────────────────
+
+AGENT_SYSTEM = """Você é o assistente pessoal de Marcos Lima, contador tributário da Compliance-CE (marcoslima@compliance-ce.com.br).
+Você opera dentro do Telegram e tem acesso às ferramentas abaixo para gerenciar emails, gerar pareceres tributários e criar cards no Trello.
+
+Regras:
+- Responda sempre em português, de forma direta e prática
+- Para executar ações, use as ferramentas disponíveis — não apenas descreva o que fazer
+- Quando o usuário pede algo ambíguo, prefira agir e explicar brevemente o que fez
+- Ao listar emails, seja conciso: assunto + remetente, sem repetir cabeçalhos
+- Para pareceres tributários, sempre use a ferramenta gerar_parecer para iniciar o fluxo interativo"""
+
+CLAUDE_TOOLS = [
+    {
+        "name": "ver_emails",
+        "description": "Lista emails não lidos. Use para pedidos como 'o que chegou hoje?', 'tem algo urgente?', 'emails da semana', 'ver financeiro', etc.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "periodo": {
+                    "type": "string",
+                    "enum": ["hoje", "semana", "tudo"],
+                    "description": "hoje=últimas 24h, semana=últimos 7d, tudo=caixa inteira"
+                },
+                "categoria": {
+                    "type": "string",
+                    "enum": ["URGENTE", "VENDAS", "PROFISSIONAL", "PESSOAL", "FINANCEIRO", "OUTROS"],
+                    "description": "Filtrar por categoria (omitir para todas)"
+                }
+            }
+        }
+    },
+    {
+        "name": "contar_emails",
+        "description": "Resumo geral com contagem de emails não lidos por categoria. Use para visão geral rápida ('quantos emails tenho?', 'resumo da caixa').",
+        "input_schema": {"type": "object", "properties": {}}
+    },
+    {
+        "name": "buscar_email",
+        "description": "Busca o email mais recente de uma pessoa específica pelo nome.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "nome": {"type": "string", "description": "Nome ou parte do nome do remetente"}
+            },
+            "required": ["nome"]
+        }
+    },
+    {
+        "name": "analisar_email",
+        "description": "Busca o email mais recente de um remetente e retorna análise com resumo e plano de ação.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "nome": {"type": "string", "description": "Nome do remetente"}
+            },
+            "required": ["nome"]
+        }
+    },
+    {
+        "name": "gerar_parecer",
+        "description": "Inicia o fluxo interativo para gerar parecer técnico tributário. Use quando o usuário pedir 'parecer', 'análise tributária', 'orientação fiscal', etc.",
+        "input_schema": {"type": "object", "properties": {}}
+    },
+    {
+        "name": "listar_remetentes",
+        "description": "Ranking de quem mais enviou emails não lidos. Use para 'quem mais manda email?', 'principais contatos', 'mapeamento de remetentes'.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "periodo": {
+                    "type": "string",
+                    "enum": ["hoje", "semana", "tudo"],
+                    "description": "Período de busca"
+                }
+            }
+        }
+    },
+    {
+        "name": "varredura_alertas",
+        "description": "Varre toda a caixa procurando emails com palavras-chave críticas: clientes, SPED, PGFN, intimações, etc.",
+        "input_schema": {"type": "object", "properties": {}}
+    },
+    {
+        "name": "marcar_lidos",
+        "description": "Marca todos os emails não lidos como lidos. Use para 'zera a caixa', 'marcar tudo como lido'.",
+        "input_schema": {"type": "object", "properties": {}}
+    },
+]
+
 ANTHROPIC_API_KEY = os.environ.get('ANTHROPIC_API_KEY', '')
 claude_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY) if ANTHROPIC_API_KEY else None
 
@@ -1584,6 +1674,89 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def _execute_tool(tool_name, tool_input, update, context):
+    """Executa a ferramenta escolhida pelo Claude e retorna texto do resultado."""
+    periodo_map = {'hoje': 24, 'semana': 168, 'tudo': None}
+
+    if tool_name == 'ver_emails':
+        periodo = tool_input.get('periodo', 'hoje')
+        cat = tool_input.get('categoria')
+        hours = periodo_map.get(periodo, 24)
+        buckets, total, spam, err = fetch_emails(hours=hours, only_cat=cat, limit=100)
+        if err:
+            await update.message.reply_text(f'❌ Erro: {err}')
+        else:
+            title = f'📬 {periodo.capitalize()} — {total} total, {spam} propagandas'
+            await update.message.reply_text(build_message(buckets, title))
+
+    elif tool_name == 'contar_emails':
+        total, counts, spam, err = count_by_category(limit=500)
+        if err:
+            await update.message.reply_text(f'❌ Erro: {err}')
+        else:
+            lines = [f'📊 {total} emails não lidos\n']
+            for cat, n in counts.items():
+                if n > 0:
+                    lines.append(f'{ICONS[cat]} {cat}: {n}')
+            lines.append(f'🗑️ Propaganda: {spam}')
+            await update.message.reply_text('\n'.join(lines))
+
+    elif tool_name == 'buscar_email':
+        nome = tool_input['nome']
+        await update.message.reply_text(f'🔍 Buscando email de {nome}...')
+        data = search_email_by_name(nome)
+        if not data:
+            await update.message.reply_text(f'📭 Nenhum email encontrado de "{nome}".')
+        else:
+            await update.message.reply_text(
+                f'📧 De: {data["sender"]}\n'
+                f'📌 Assunto: {data["subject"]}\n'
+                f'📅 Data: {data["date"]}\n\n'
+                f'{data["body"][:800]}'
+            )
+
+    elif tool_name == 'analisar_email':
+        nome = tool_input['nome']
+        await update.message.reply_text(f'🔍 Buscando email de {nome}...')
+        data = search_email_by_name(nome)
+        if not data:
+            await update.message.reply_text(f'📭 Nenhum email encontrado de "{nome}".')
+        else:
+            await update.message.reply_text('⏳ Analisando com IA...')
+            analysis = analyze_with_claude(data)
+            await update.message.reply_text(analysis)
+
+    elif tool_name == 'gerar_parecer':
+        await cmd_gerar_parecer(update, context)
+
+    elif tool_name == 'listar_remetentes':
+        periodo = tool_input.get('periodo', 'tudo')
+        hours = periodo_map.get(periodo)
+        await update.message.reply_text(f'🔍 Mapeando remetentes ({periodo})...')
+        result, spam_count, err = fetch_by_sender(hours=hours, limit=300)
+        if err:
+            await update.message.reply_text(f'❌ {err}')
+        else:
+            total_emails = sum(c for _, _, c, _ in result)
+            lines = [f'👥 {len(result)} remetentes, {total_emails} emails ({periodo})\n']
+            for nome, addr, count, cat in result[:20]:
+                icon = ICONS.get(cat, '📌')
+                bar = '█' * min(count, 10) + ('…' if count > 10 else '')
+                lines.append(f'{icon} {bar} {count}x  {nome}\n   {addr}')
+            if len(result) > 20:
+                lines.append(f'\n... e mais {len(result) - 20} remetentes')
+            await update.message.reply_text('\n'.join(lines))
+
+    elif tool_name == 'varredura_alertas':
+        await cmd_varredura(update, context)
+
+    elif tool_name == 'marcar_lidos':
+        total = mark_as_read()
+        await update.message.reply_text(
+            f'✅ {total} email(s) marcados como lidos.' if total >= 0 else '❌ Erro ao marcar emails.'
+        )
+
+
 @only_authorized
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Intercepta digitação de nome de pasta durante fluxo de parecer
@@ -1606,126 +1779,48 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     reply_markup=InlineKeyboardMarkup(buttons)
                 )
             else:
-                await update.message.reply_text('❌ Erro ao criar pasta. Verifique se a conta de serviço tem acesso ao Drive.')
+                await update.message.reply_text('❌ Erro ao criar pasta. Verifique o acesso ao Drive.')
             return
 
-    text = update.message.text.lower().strip()
-
-    if any(w in text for w in [
-        'todos', 'tudo', '1000', '1.000', 'pendentes', 'quantos', 'fila',
-        'geral', 'não lidos', 'nao lidos', 'caixa toda', 'caixa inteira',
-        'ler tudo', 'ver tudo', 'listar tudo', 'quanto tem', 'quantos tem',
-        'overview', 'visao geral', 'visão geral',
-    ]):
-        await cmd_todos(update, context)
-
-    elif any(w in text for w in [
-        'hoje', 'do dia', 'chegou hoje', 'recebi hoje',
-        'ultimas 24', 'últimas 24', 'ultimo dia', 'último dia',
-    ]):
-        await cmd_hoje(update, context)
-
-    elif any(w in text for w in [
-        'semana', 'essa semana', 'esta semana', 'ultimos 7', 'últimos 7',
-    ]):
-        await cmd_semana(update, context)
-
-    elif any(w in text for w in [
-        'urgente', 'urgentes', 'importante', 'importantes', 'critico',
-        'crítico', 'atenção', 'atencao', 'resolver', 'pendencia',
-        'pendência', 'prazo', 'vencer', 'vencendo', 'gestta',
-        'certificado', 'regularize', 'pgfn',
-    ]):
-        await cmd_urgente(update, context)
-
-    elif any(w in text for w in [
-        'venda', 'vendas', 'vendi', 'vendeu', 'vendemos',
-        'hotmart', 'eduzz', 'faturamento', 'novo aluno', 'nova venda', 'quanto vendi',
-    ]):
-        await cmd_vendas(update, context)
-
-    elif any(w in text for w in [
-        'profissional', 'juridico', 'tributario', 'conjur', 'legisweb',
-        'jurídico', 'tributário', 'reforma tributaria', 'boletim', 'legislacao',
-    ]):
-        await cmd_profissional(update, context)
-
-    elif any(w in text for w in [
-        'financeiro', 'financeira', 'xp', 'xpi', 'pix', 'banco',
-        'extrato', 'transferencia', 'investimento',
-    ]):
-        await cmd_financeiro(update, context)
-
-    elif any(w in text for w in [
-        'pessoal', 'davi', 'escola', 'familia', 'família', 'colmaster', 'nota', 'filho',
-    ]):
-        await cmd_pessoal(update, context)
-
-    elif any(w in text for w in [
-        'parecer', 'gerar parecer', 'quero parecer', 'faz o parecer',
-        'elaborar parecer', 'monta o parecer', 'gera o parecer',
-    ]):
-        await cmd_gerar_parecer(update, context)
-
-    elif any(w in text for w in [
-        'remetente', 'remetentes', 'quem mandou', 'quem enviou',
-        'por remetente', 'por pessoa', 'quem mais manda', 'quem mais envia',
-        'ranking', 'quem é importante', 'mapa de contatos', 'frequência',
-        'frequencia', 'quem aparece mais',
-    ]):
-        await cmd_remetentes(update, context)
-
-    elif any(w in text for w in [
-        'email do', 'email da', 'email de', 'analisar email',
-        'plano de acao', 'plano de ação', 'o que fazer com',
-        'o que preciso fazer', 'analisa email',
-    ]):
-        await cmd_analisar_email(update, context)
-
-    elif any(w in text for w in [
-        'email pessoal', 'emails pessoais', 'cnp', 'gmail pessoal',
-        'meu pessoal', 'conta pessoal', 'ler pessoal',
-    ]):
-        await cmd_pessoal_gmail(update, context)
-
-    elif any(w in text for w in [
-        'varredura', 'varrer', 'buscar alertas', 'busca agora', 'checar agora',
-        'verificar agora', 'procurar clientes', 'scan',
-    ]):
-        await cmd_varredura(update, context)
-
-    elif any(w in text for w in [
-        'alerta', 'alertas', 'monitorando', 'palavras', 'palavras-chave', 'keywords',
-    ]):
-        await cmd_alertas(update, context)
-
-    elif any(w in text for w in [
-        'marcar', 'lido', 'lidos', 'arquivar', 'limpar', 'zerar',
-        'zera', 'limpa', 'marca lido', 'marca todos', 'marcar como lido',
-    ]):
-        await cmd_marcar_lido(update, context)
-
-    elif any(w in text for w in [
-        'email', 'emails', 'ler', 'leia', 'resumo', 'caixa', 'inbox',
-        'mensagem', 'mensagens', 'me mostra', 'o que tem',
-    ]):
-        await cmd_todos(update, context)
-
-    elif any(w in text for w in ['ajuda', 'help', 'comandos', 'menu']):
+    # Comandos diretos que não precisam de IA
+    text_lower = update.message.text.lower().strip()
+    if text_lower in ('ajuda', 'help', '/ajuda', '/help'):
         await cmd_help(update, context)
+        return
 
-    else:
-        await update.message.reply_text(
-            'Não entendi 😅\n\n'
-            'Exemplos:\n'
-            '• "ler os 1000 emails"\n'
-            '• "tem algo urgente?"\n'
-            '• "quanto vendi essa semana?"\n'
-            '• "o que chegou hoje?"\n'
-            '• "zera a caixa"\n'
-            '• "ver alertas"\n\n'
-            'Digite ajuda para tudo.'
+    # Sem Claude configurado — fallback para help
+    if not claude_client:
+        await update.message.reply_text('❌ ANTHROPIC_API_KEY não configurada.')
+        return
+
+    # ── Claude como cérebro ──────────────────────────────────────────────────
+    user_text = update.message.text.strip()
+    context_note = ''
+    if _parecer_pending:
+        n = len(_parecer_pending)
+        context_note = f'\n\n[Contexto: {n} solicitação(ões) de parecer pendente(s) na fila.]'
+
+    try:
+        response = claude_client.messages.create(
+            model='claude-haiku-4-5-20251001',
+            max_tokens=800,
+            system=AGENT_SYSTEM + context_note,
+            tools=CLAUDE_TOOLS,
+            messages=[{'role': 'user', 'content': user_text}]
         )
+
+        if response.stop_reason == 'tool_use':
+            for block in response.content:
+                if block.type == 'tool_use':
+                    await _execute_tool(block.name, block.input, update, context)
+                    break
+        else:
+            reply = ''.join(b.text for b in response.content if hasattr(b, 'text')).strip()
+            if reply:
+                await update.message.reply_text(reply)
+
+    except Exception as e:
+        await update.message.reply_text(f'❌ Erro ao processar: {e}')
 
 
 # ─── MAIN ────────────────────────────────────────────────────────────────────
