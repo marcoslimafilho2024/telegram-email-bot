@@ -5,6 +5,8 @@ import json
 import re
 import smtplib
 import requests
+import io as _io_module
+from email import encoders as _email_encoders
 from email.header import decode_header
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -124,6 +126,9 @@ TRELLO_TOKEN = os.environ.get('TRELLO_TOKEN', '')
 TRELLO_MESA1_LIST_ID = os.environ.get('TRELLO_MESA1_LIST_ID', '')
 TRELLO_LABEL_URGENTE_ID = os.environ.get('TRELLO_LABEL_URGENTE_ID', '')
 
+# ─── DRIVE PARECER ────────────────────────────────────────────────────────────
+DRIVE_PARECER_ROOT_ID = os.environ.get('DRIVE_PARECER_ROOT_ID', '1Jd3oC3gNQoYXPUuKKBF8PrMZNUEkKT9m')
+
 # ─── REGRAS AUTOMÁTICAS ───────────────────────────────────────────────────────
 # Quando email bate numa regra: alerta Telegram + encaminha automaticamente
 
@@ -157,6 +162,11 @@ _alerted_ids = set()
 
 # Controle de solicitações de parecer pendentes: uid -> email_data
 _parecer_pending = {}
+
+# ─── ESTADO DO FLUXO INTERATIVO DE PARECER ───────────────────────────────────
+_flow_counter = 0
+_parecer_flow = {}        # fid -> state dict
+_flow_folders_cache = {}  # fid -> [(name, id), ...]
 
 # ─── DETECÇÃO DE SOLICITAÇÕES DE PARECER ─────────────────────────────────────
 # Palavras no ASSUNTO que sugerem consulta tributária/fiscal
@@ -702,6 +712,229 @@ def build_message(buckets, title='📬 Emails não lidos'):
     return '\n'.join(lines).strip()
 
 
+# ─── DRIVE PARECER — HELPERS ─────────────────────────────────────────────────
+
+def _drive_service():
+    sa_json = os.environ.get('GOOGLE_SERVICE_ACCOUNT_JSON', '')
+    if not sa_json:
+        return None
+    import json as _j
+    from google.oauth2 import service_account
+    from googleapiclient.discovery import build
+    creds = service_account.Credentials.from_service_account_info(
+        _j.loads(sa_json), scopes=['https://www.googleapis.com/auth/drive']
+    )
+    return build('drive', 'v3', credentials=creds)
+
+
+def list_drive_subfolders(parent_id):
+    svc = _drive_service()
+    if not svc:
+        return []
+    try:
+        res = svc.files().list(
+            q=f"'{parent_id}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false",
+            fields='files(id,name)', orderBy='name'
+        ).execute()
+        return [(f['name'], f['id']) for f in res.get('files', [])]
+    except Exception as e:
+        print(f'list_drive_subfolders: {e}')
+        return []
+
+
+def create_drive_folder(name, parent_id):
+    svc = _drive_service()
+    if not svc:
+        return None, None
+    try:
+        meta = {'name': name, 'mimeType': 'application/vnd.google-apps.folder', 'parents': [parent_id]}
+        f = svc.files().create(body=meta, fields='id,webViewLink').execute()
+        return f['id'], f.get('webViewLink', '')
+    except Exception as e:
+        print(f'create_drive_folder: {e}')
+        return None, None
+
+
+def upload_docx_and_pdf(docx_bytes, base_filename, folder_id):
+    """Uploads .docx + converts to .pdf via Google Docs. Returns (docx_url, pdf_url, pdf_bytes)."""
+    svc = _drive_service()
+    if not svc:
+        return None, None, None
+    from googleapiclient.http import MediaIoBaseUpload, MediaIoBaseDownload
+    DOCX_MIME = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+    try:
+        # Upload DOCX
+        docx_meta = {'name': base_filename + '.docx', 'parents': [folder_id]}
+        docx_file = svc.files().create(
+            body=docx_meta,
+            media_body=MediaIoBaseUpload(_io_module.BytesIO(docx_bytes), mimetype=DOCX_MIME),
+            fields='id,webViewLink'
+        ).execute()
+        docx_url = docx_file.get('webViewLink', '')
+
+        # Upload as Google Doc (for PDF export)
+        gdoc_meta = {'name': base_filename + '_tmp', 'parents': [folder_id],
+                     'mimeType': 'application/vnd.google-apps.document'}
+        gdoc = svc.files().create(
+            body=gdoc_meta,
+            media_body=MediaIoBaseUpload(_io_module.BytesIO(docx_bytes), mimetype=DOCX_MIME),
+            fields='id'
+        ).execute()
+        gdoc_id = gdoc['id']
+
+        # Export PDF bytes
+        req = svc.files().export_media(fileId=gdoc_id, mimeType='application/pdf')
+        pdf_buf = _io_module.BytesIO()
+        dl = MediaIoBaseDownload(pdf_buf, req)
+        done = False
+        while not done:
+            _, done = dl.next_chunk()
+        pdf_bytes = pdf_buf.getvalue()
+
+        # Delete temp Google Doc
+        try:
+            svc.files().delete(fileId=gdoc_id).execute()
+        except Exception:
+            pass
+
+        # Upload PDF
+        pdf_meta = {'name': base_filename + '.pdf', 'parents': [folder_id]}
+        pdf_file = svc.files().create(
+            body=pdf_meta,
+            media_body=MediaIoBaseUpload(_io_module.BytesIO(pdf_bytes), mimetype='application/pdf'),
+            fields='id,webViewLink'
+        ).execute()
+        pdf_url = pdf_file.get('webViewLink', '')
+
+        return docx_url, pdf_url, pdf_bytes
+    except Exception as e:
+        print(f'upload_docx_and_pdf: {e}')
+        return None, None, None
+
+
+def generate_parecer_docx(parecer_text, empresa, cnpj, modelo):
+    """Returns BytesIO with formatted DOCX."""
+    try:
+        from docx import Document
+        from docx.shared import Pt, Inches
+        from docx.enum.text import WD_ALIGN_PARAGRAPH
+    except ImportError:
+        return None
+
+    doc = Document()
+    for sec in doc.sections:
+        sec.top_margin = Inches(1)
+        sec.bottom_margin = Inches(1)
+        sec.left_margin = Inches(1.2)
+        sec.right_margin = Inches(1.2)
+
+    t = doc.add_paragraph()
+    t.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    r = t.add_run(f'PARECER TÉCNICO {"EMPRESARIAL" if modelo == "EMPRESARIAL" else "GERAL"}')
+    r.bold = True
+    r.font.size = Pt(14)
+
+    c = doc.add_paragraph()
+    c.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    c.add_run(empresa + (f'  |  CNPJ: {cnpj}' if cnpj else ''))
+
+    doc.add_paragraph()
+
+    for line in parecer_text.split('\n'):
+        p = doc.add_paragraph(line if line.strip() else '')
+        if re.match(r'^\d{1,2}\.\s', line.strip()):
+            for run in p.runs:
+                run.bold = True
+                run.font.size = Pt(12)
+
+    buf = _io_module.BytesIO()
+    doc.save(buf)
+    buf.seek(0)
+    return buf
+
+
+def generate_parecer_claude_v2(email_data, modelo):
+    """Generates parecer with GERAL or EMPRESARIAL focus."""
+    if not claude_client:
+        return None
+    empresa = email_data.get('empresa', 'Cliente')
+    cnpj = email_data.get('cnpj', '')
+    hoje = datetime.now().strftime('%d/%m/%Y')
+
+    instrucao = (
+        'MODELO EMPRESARIAL — foco em estrutura societária, planejamento tributário preventivo, '
+        'impactos por setor/CNAE, riscos de contingência e recomendações estratégicas.'
+        if modelo == 'EMPRESARIAL' else
+        'MODELO GERAL — foco em análise técnica da legislação, interpretação normativa, '
+        'orientações operacionais para conformidade e jurisprudência aplicável.'
+    )
+
+    prompt = f"""Você é Marcos Lima, contador tributário da Compliance-CE.
+{instrucao}
+
+Elabore um PARECER TÉCNICO completo nas 10 seções:
+
+1. CABEÇALHO — Data: {hoje} | Empresa: {empresa} | CNPJ: {cnpj} | Parecerista: Marcos Lima — CRC/CE
+2. QUESTIONAMENTO — Contextualize a consulta com base no email.
+3. BASE LEGAL ATUALIZADA — Artigos/incisos/alíneas. Ex: "LC 214/2025, art. X, § Y"
+4. INTERPRETAÇÃO NORMATIVA — Análise técnica, hermenêutica, doutrina.
+5. IMPLICAÇÕES PRÁTICAS — Consequências fiscal, operacional e contábil.
+6. ORIENTAÇÕES OPERACIONAIS — O que fazer: prazos, procedimentos.
+7. VEDAÇÕES OU EXCEÇÕES — Restrições, exceções, riscos de autuação.
+8. CITAÇÕES COMPLEMENTARES — Jurisprudência, Soluções de Consulta, SEFAZ.
+9. CONCLUSÃO — Resposta direta e objetiva a cada pergunta.
+10. ASSINATURA TÉCNICA — Marcos Lima — CRC/CE | {hoje}
+    ⚠️ PARECER PRELIMINAR — sujeito a revisão antes da entrega.
+
+Email recebido:
+De: {email_data['sender']}
+Assunto: {email_data['subject']}
+
+{email_data['body']}
+
+Responda em português, linguagem técnica tributária. Cite legislação completa e precisa."""
+
+    msg = claude_client.messages.create(
+        model='claude-sonnet-4-6',
+        max_tokens=4500,
+        messages=[{'role': 'user', 'content': prompt}]
+    )
+    return msg.content[0].text
+
+
+def reply_email_with_pdf(email_data, pdf_bytes, base_filename, summary):
+    """Sends a reply email with the PDF attached."""
+    try:
+        acc = ACCOUNTS[0]
+        for a in ACCOUNTS:
+            if email_data.get('account', '') == a['label']:
+                acc = a
+                break
+
+        original_sender = email_data.get('sender', '')
+        m = re.match(r'.*<([^>]+)>', original_sender)
+        reply_to = m.group(1) if m else original_sender
+
+        msg = MIMEMultipart()
+        msg['From'] = acc['user']
+        msg['To'] = reply_to
+        msg['Subject'] = f'Re: {email_data["subject"]}'
+        msg.attach(MIMEText(summary, 'plain', 'utf-8'))
+
+        part = MIMEBase('application', 'pdf')
+        part.set_payload(pdf_bytes)
+        _email_encoders.encode_base64(part)
+        part.add_header('Content-Disposition', f'attachment; filename="{base_filename}.pdf"')
+        msg.attach(part)
+
+        with smtplib.SMTP_SSL('smtp.gmail.com', 465) as smtp:
+            smtp.login(acc['user'], acc['password'])
+            smtp.sendmail(acc['user'], [reply_to], msg.as_bytes())
+        return True, None
+    except Exception as e:
+        return False, str(e)
+
+
 # ─── MONITORAMENTO AUTOMÁTICO (a cada 10 min) ─────────────────────────────────
 
 async def check_alerts(context):
@@ -983,60 +1216,192 @@ async def cmd_analisar_email(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 @only_authorized
 async def cmd_gerar_parecer(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Gera parecer preliminar com base no último email de consulta pendente."""
+    """Inicia o fluxo interativo de geração de parecer."""
+    global _flow_counter
+
     if not _parecer_pending:
-        await update.message.reply_text('📭 Nenhuma solicitação de parecer pendente.\n\nO bot detecta automaticamente emails pedindo orientação/análise tributária.')
+        await update.message.reply_text(
+            '📭 Nenhuma solicitação de parecer pendente.\n\n'
+            'O bot detecta automaticamente emails pedindo orientação/análise tributária.'
+        )
         return
 
     uid, email_data = list(_parecer_pending.items())[-1]
+
+    _flow_counter += 1
+    fid = _flow_counter
+    _parecer_flow[fid] = {'uid': uid, 'email_data': email_data, 'state': 'folder_select'}
+
+    await update.message.reply_text('⏳ Carregando pastas do Drive...')
+
+    folders = list_drive_subfolders(DRIVE_PARECER_ROOT_ID)
+    _flow_folders_cache[fid] = folders
+
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+    buttons = [
+        [InlineKeyboardButton(f'📁 {name[:45]}', callback_data=f'fs:{fid}:{idx}')]
+        for idx, (name, _) in enumerate(folders[:8])
+    ]
+    buttons.append([InlineKeyboardButton('➕ Criar nova pasta', callback_data=f'fn:{fid}')])
+
     empresa = email_data.get('empresa', 'Cliente')
     cnpj = email_data.get('cnpj', '')
-
     await update.message.reply_text(
-        f'⏳ Gerando parecer preliminar...\n'
-        f'🏢 Empresa: {empresa}\n'
-        f'📋 CNPJ: {cnpj}\n\n'
-        f'Aguarde até 30 segundos.'
+        f'📂 Selecione a pasta de destino:\n🏢 {empresa}' + (f'  |  {cnpj}' if cnpj else ''),
+        reply_markup=InlineKeyboardMarkup(buttons)
     )
 
-    parecer = generate_parecer_claude(email_data)
-    if not parecer:
-        await update.message.reply_text('❌ Erro ao gerar parecer. Verifique a variável ANTHROPIC_API_KEY.')
+
+async def handle_callback_query(update, context):
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+    query = update.callback_query
+    await query.answer()
+
+    if query.message.chat.id != CHAT_ID:
         return
 
-    _parecer_pending.pop(uid, None)
+    parts = query.data.split(':', 2)
+    action = parts[0]
+    try:
+        fid = int(parts[1])
+    except (IndexError, ValueError):
+        return
+    extra = parts[2] if len(parts) > 2 else None
 
-    header = (
-        f'📋 PARECER TÉCNICO PRELIMINAR\n'
-        f'🏢 {empresa}'
-        + (f' | CNPJ: {cnpj}' if cnpj else '') +
-        f'\n⚠️ RASCUNHO — revisar antes de entregar ao cliente\n'
-        f'{"─" * 40}\n\n'
-    )
-    full_text = header + parecer
+    if fid not in _parecer_flow:
+        await query.edit_message_text('❌ Sessão expirada. Responda "parecer" novamente.')
+        return
 
-    # Envia em partes no Telegram
-    chunks = [full_text[i:i+4000] for i in range(0, len(full_text), 4000)]
-    for chunk in chunks:
-        await update.message.reply_text(chunk)
+    flow = _parecer_flow[fid]
 
-    # Tenta salvar no Google Drive
-    link = save_to_drive(full_text, empresa, cnpj)
-    if link:
-        await update.message.reply_text(f'✅ Salvo no Google Drive:\n{link}')
-    else:
-        # Envia como arquivo .txt no Telegram
-        import io
-        from telegram import InputFile
+    if action == 'fs':
+        idx = int(extra)
+        folders = _flow_folders_cache.get(fid, [])
+        name, folder_id = folders[idx]
+        flow['folder_id'] = folder_id
+        flow['folder_name'] = name
+        flow['state'] = 'modelo_select'
+        buttons = [
+            [InlineKeyboardButton('📋 MODELO GERAL', callback_data=f'mg:{fid}')],
+            [InlineKeyboardButton('🏢 MODELO EMPRESARIAL', callback_data=f'me:{fid}')],
+        ]
+        await query.edit_message_text(
+            f'✅ Pasta: {name}\n\n📝 Selecione o modelo do parecer:',
+            reply_markup=InlineKeyboardMarkup(buttons)
+        )
+
+    elif action == 'fn':
+        flow['state'] = 'folder_new'
+        await query.edit_message_text(
+            '📝 Digite o nome da nova pasta no Drive:\n'
+            '(ex: "Empresa XYZ — Reforma Tributária")'
+        )
+
+    elif action in ('mg', 'me'):
+        flow['modelo'] = 'GERAL' if action == 'mg' else 'EMPRESARIAL'
+        flow['state'] = 'generating'
+        await query.edit_message_text(f'⏳ Gerando parecer {flow["modelo"]}... aguarde até 1 minuto.')
+        await _gerar_e_salvar(context, fid, flow)
+
+    elif action == 'as':
+        await _enviar_email_resposta(query, context, fid, flow)
+
+    elif action == 'ac':
+        _parecer_flow.pop(fid, None)
+        await query.edit_message_text('✅ Parecer salvo no Drive. Envio por email cancelado.')
+
+
+async def _gerar_e_salvar(context, fid, flow):
+    """Generates parecer, DOCX+PDF, uploads to Drive, sends to Telegram."""
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputFile
+    email_data = flow['email_data']
+    empresa = email_data.get('empresa', 'Cliente')
+    cnpj = email_data.get('cnpj', '')
+    modelo = flow['modelo']
+
+    try:
+        parecer_text = generate_parecer_claude_v2(email_data, modelo)
+        if not parecer_text:
+            await context.bot.send_message(chat_id=CHAT_ID, text='❌ Erro ao gerar parecer (API Claude).')
+            return
+        flow['parecer_text'] = parecer_text
+
         ts = datetime.now().strftime('%Y%m%d_%H%M')
         empresa_clean = re.sub(r'[^\w\s\-]', '', empresa).strip()[:40]
-        filename = f'PARECER_{empresa_clean}_{ts}.txt'
-        file_bytes = io.BytesIO(full_text.encode('utf-8'))
-        await context.bot.send_document(
+        base_filename = f'PARECER_{empresa_clean}_{ts}'
+        flow['base_filename'] = base_filename
+
+        docx_buf = generate_parecer_docx(parecer_text, empresa, cnpj, modelo)
+        docx_url, pdf_url, pdf_bytes = None, None, None
+        if docx_buf:
+            docx_bytes = docx_buf.read()
+            docx_url, pdf_url, pdf_bytes = upload_docx_and_pdf(docx_bytes, base_filename, flow['folder_id'])
+
+        flow['docx_url'] = docx_url
+        flow['pdf_url'] = pdf_url
+        flow['pdf_bytes'] = pdf_bytes
+        flow['state'] = 'await_auth'
+
+        lines = [
+            f'✅ PARECER GERADO — {modelo}\n',
+            f'🏢 {empresa}' + (f'  |  CNPJ: {cnpj}' if cnpj else ''),
+            f'📁 Pasta: {flow["folder_name"]}\n',
+        ]
+        if docx_url:
+            lines.append(f'📄 DOCX: {docx_url}')
+        if pdf_url:
+            lines.append(f'📑 PDF: {pdf_url}')
+
+        buttons = [
+            [InlineKeyboardButton('✅ Autorizar envio por email', callback_data=f'as:{fid}')],
+            [InlineKeyboardButton('❌ Não enviar', callback_data=f'ac:{fid}')],
+        ]
+        await context.bot.send_message(
             chat_id=CHAT_ID,
-            document=InputFile(file_bytes, filename=filename),
-            caption=f'📄 {filename}'
+            text='\n'.join(lines),
+            reply_markup=InlineKeyboardMarkup(buttons)
         )
+
+        if pdf_bytes:
+            await context.bot.send_document(
+                chat_id=CHAT_ID,
+                document=InputFile(_io_module.BytesIO(pdf_bytes), filename=base_filename + '.pdf'),
+                caption=f'📑 {base_filename}.pdf'
+            )
+
+        _parecer_pending.pop(flow.get('uid'), None)
+
+    except Exception as e:
+        await context.bot.send_message(chat_id=CHAT_ID, text=f'❌ Erro ao processar parecer: {e}')
+
+
+async def _enviar_email_resposta(query, context, fid, flow):
+    email_data = flow['email_data']
+    pdf_bytes = flow.get('pdf_bytes')
+    base_filename = flow.get('base_filename', 'PARECER')
+
+    if not pdf_bytes:
+        await query.edit_message_text('❌ PDF não disponível para envio.')
+        return
+
+    summary = (
+        f'Prezado(a),\n\n'
+        f'Segue em anexo o parecer técnico da Compliance-CE '
+        f'em resposta à sua consulta: {email_data["subject"]}.\n\n'
+        f'Qualquer dúvida, estamos à disposição.\n\n'
+        f'Atenciosamente,\n'
+        f'Marcos Lima — CRC/CE\n'
+        f'Compliance-CE'
+    )
+
+    ok, err = reply_email_with_pdf(email_data, pdf_bytes, base_filename, summary)
+    if ok:
+        _parecer_flow.pop(fid, None)
+        await query.edit_message_text(
+            f'✅ Email enviado!\nPara: {email_data["sender"]}\nAnexo: {base_filename}.pdf'
+        )
+    else:
+        await query.edit_message_text(f'❌ Falha ao enviar email:\n{(err or "")[:300]}')
 
 
 @only_authorized
@@ -1173,6 +1538,29 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @only_authorized
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Intercepta digitação de nome de pasta durante fluxo de parecer
+    for fid, flow in list(_parecer_flow.items()):
+        if flow.get('state') == 'folder_new':
+            from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+            folder_name = update.message.text.strip()
+            await update.message.reply_text(f'⏳ Criando pasta "{folder_name}"...')
+            folder_id, _ = create_drive_folder(folder_name, DRIVE_PARECER_ROOT_ID)
+            if folder_id:
+                flow['folder_id'] = folder_id
+                flow['folder_name'] = folder_name
+                flow['state'] = 'modelo_select'
+                buttons = [
+                    [InlineKeyboardButton('📋 MODELO GERAL', callback_data=f'mg:{fid}')],
+                    [InlineKeyboardButton('🏢 MODELO EMPRESARIAL', callback_data=f'me:{fid}')],
+                ]
+                await update.message.reply_text(
+                    f'✅ Pasta criada: {folder_name}\n\n📝 Selecione o modelo do parecer:',
+                    reply_markup=InlineKeyboardMarkup(buttons)
+                )
+            else:
+                await update.message.reply_text('❌ Erro ao criar pasta. Verifique se a conta de serviço tem acesso ao Drive.')
+            return
+
     text = update.message.text.lower().strip()
 
     if any(w in text for w in [
@@ -1299,6 +1687,9 @@ def main():
 
     # Monitoramento automático a cada 10 minutos
     app.job_queue.run_repeating(check_alerts, interval=600, first=30)
+
+    from telegram.ext import CallbackQueryHandler
+    app.add_handler(CallbackQueryHandler(handle_callback_query))
 
     app.add_handler(CommandHandler('start', cmd_todos))
     app.add_handler(CommandHandler('todos', cmd_todos))
