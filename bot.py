@@ -245,25 +245,30 @@ def fetch_headers(mail, ids, limit=200):
 
 
 def match_rule(sender, subject):
-    """Retorna a regra que bate com o email, ou None."""
+    """Retorna a regra que bate com o email, ou None.
+    match_logic 'and' (padrão): remetente E assunto devem bater.
+    match_logic 'or': qualquer um dos dois basta.
+    """
     s, sub = sender.lower(), subject.lower()
     for rule in RULES:
         from_match = any(x in s for x in rule['match_from'])
         subj_match = any(x in sub for x in rule['match_subject'])
-        if from_match or subj_match:
+        logic = rule.get('match_logic', 'and')
+        matched = (from_match or subj_match) if logic == 'or' else (from_match and subj_match)
+        if matched:
             return rule
     return None
 
 
 def forward_email(original_msg_bytes, rule, acc):
-    """Encaminha o email via SMTP usando a conta configurada na regra."""
+    """Encaminha o email via SMTP usando a conta configurada na regra.
+    Retorna (True, None) em caso de sucesso ou (False, mensagem_erro).
+    """
     try:
-        # Seleciona a conta de envio
         send_acc = next(
             (a for a in ACCOUNTS if rule['forward_from_account'] in a['user']),
             ACCOUNTS[0]
         )
-        # Monta email de encaminhamento
         original = email.message_from_bytes(original_msg_bytes)
         orig_from = decode_str(original.get('From', ''))
         orig_subject = decode_str(original.get('Subject', ''))
@@ -287,10 +292,11 @@ def forward_email(original_msg_bytes, rule, acc):
         with smtplib.SMTP_SSL('smtp.gmail.com', 465) as smtp:
             smtp.login(send_acc['user'], send_acc['password'])
             smtp.sendmail(send_acc['user'], rule['forward_to'], fwd.as_bytes())
-        return True
+        return True, None
     except Exception as e:
-        print(f'Erro ao encaminhar email: {e}')
-        return False
+        err = str(e)
+        print(f'Erro ao encaminhar email [{send_acc["user"] if "send_acc" in dir() else "?"}]: {err}')
+        return False, err
 
 
 def get_email_body(msg):
@@ -638,19 +644,21 @@ async def check_alerts(context):
                 rule = match_rule(sender, subject)
                 if rule and uid not in _rule_processed_ids:
                     _rule_processed_ids.add(uid)
-                    # Busca email completo para encaminhar
                     _, full_data = mail.fetch(eid, '(BODY.PEEK[])')
                     full_raw = full_data[0][1]
-                    ok = forward_email(full_raw, rule, acc)
+                    ok, err_msg = forward_email(full_raw, rule, acc)
                     hora = datetime.now().strftime('%H:%M')
-                    status = '✅ Encaminhado' if ok else '❌ Falha ao encaminhar'
                     destinos = '\n'.join(f'  • {d}' for d in rule['forward_to'])
+                    if ok:
+                        detail = f'✅ Encaminhado para:\n{destinos}'
+                    else:
+                        detail = f'❌ Falha ao encaminhar para:\n{destinos}\n\n⚠️ Erro: {(err_msg or "desconhecido")[:300]}'
                     msg_tg = (
                         f'{rule["alert_msg"]}\n\n'
                         f'📧 {subject}\n'
                         f'↳ {sender}\n'
                         f'🕐 {hora}\n\n'
-                        f'{status} para:\n{destinos}'
+                        f'{detail}'
                     )
                     await context.bot.send_message(chat_id=CHAT_ID, text=msg_tg)
                     continue  # já tratado pela regra
