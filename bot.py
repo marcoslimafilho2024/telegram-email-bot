@@ -7,6 +7,7 @@ import smtplib
 import requests
 import io as _io_module
 from email import encoders as _email_encoders
+import redis as _redis_lib
 from email.header import decode_header
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -272,6 +273,98 @@ _parecer_flow = {}        # fid -> state dict
 _flow_folders_cache = {}  # fid -> [(name, id), ...]
 _last_shown_email = None  # último email exibido na conversa (contexto)
 _last_parecer = None      # último parecer gerado (pdf_bytes, urls, filename)
+
+# ─── REDIS — persistência de estado ──────────────────────────────────────────
+
+_redis_conn = None
+
+def _redis():
+    global _redis_conn
+    if _redis_conn is None:
+        url = os.environ.get('REDIS_URL', '')
+        if url:
+            try:
+                _redis_conn = _redis_lib.from_url(url, decode_responses=False)
+                _redis_conn.ping()
+                print('Redis conectado.')
+            except Exception as e:
+                print(f'Redis indisponível: {e}')
+    return _redis_conn
+
+def _rget(key, default=None):
+    r = _redis()
+    if not r: return default
+    try:
+        v = r.get(f'bot:{key}')
+        return json.loads(v) if v else default
+    except: return default
+
+def _rset(key, value, ttl=86400):
+    r = _redis()
+    if not r: return
+    try: r.setex(f'bot:{key}', ttl, json.dumps(value, ensure_ascii=False, default=str))
+    except: pass
+
+def _rget_bytes(key):
+    r = _redis()
+    if not r: return None
+    try: return r.get(f'bot:{key}')
+    except: return None
+
+def _rset_bytes(key, value, ttl=86400):
+    r = _redis()
+    if not r: return
+    try: r.setex(f'bot:{key}', ttl, value)
+    except: pass
+
+# ─── Funções de persistência (write-through: global + Redis) ─────────────────
+
+def persist_last_email(data):
+    global _last_shown_email
+    _last_shown_email = data
+    _rset('last_email', data)
+
+def persist_last_parecer(data):
+    global _last_parecer
+    _last_parecer = data
+    pdf = data.get('pdf_bytes')
+    meta = {k: v for k, v in data.items() if k != 'pdf_bytes'}
+    _rset('last_parecer_meta', meta)
+    if pdf:
+        _rset_bytes('last_parecer_pdf', pdf)
+
+def get_last_parecer():
+    if _last_parecer:
+        return _last_parecer
+    meta = _rget('last_parecer_meta')
+    if not meta:
+        return None
+    pdf = _rget_bytes('last_parecer_pdf')
+    return {**meta, 'pdf_bytes': pdf}
+
+def persist_parecer_pending():
+    _rset('parecer_pending', _parecer_pending)
+
+def load_state_from_redis():
+    """Carrega estado persistido do Redis para a memória ao iniciar."""
+    global _last_shown_email, _last_parecer, _parecer_pending, _alerted_ids, _rule_processed_ids
+    email_data = _rget('last_email')
+    if email_data:
+        _last_shown_email = email_data
+    meta = _rget('last_parecer_meta')
+    if meta:
+        pdf = _rget_bytes('last_parecer_pdf')
+        _last_parecer = {**meta, 'pdf_bytes': pdf}
+    pending = _rget('parecer_pending')
+    if pending:
+        _parecer_pending = pending
+    alerted = _rget('alerted_ids')
+    if alerted:
+        _alerted_ids = set(alerted)
+    rule_proc = _rget('rule_processed_ids')
+    if rule_proc:
+        _rule_processed_ids = set(rule_proc)
+    print(f'Estado Redis carregado: {len(_parecer_pending)} pendentes, last_email={bool(_last_shown_email)}, last_parecer={bool(_last_parecer)}')
 
 # ─── DETECÇÃO DE SOLICITAÇÕES DE PARECER ─────────────────────────────────────
 # Palavras no ASSUNTO que sugerem consulta tributária/fiscal
@@ -1093,6 +1186,7 @@ async def check_alerts(context):
                 rule = match_rule(sender, subject)
                 if rule and uid not in _rule_processed_ids:
                     _rule_processed_ids.add(uid)
+                    _rset('rule_processed_ids', list(_rule_processed_ids))
                     _, full_data = mail.fetch(eid, '(BODY.PEEK[])')
                     full_raw = full_data[0][1]
                     hora = datetime.now().strftime('%H:%M')
@@ -1151,6 +1245,7 @@ async def check_alerts(context):
                                 'cnpj': cnpj or '',
                                 'account': acc['label'],
                             }
+                            persist_parecer_pending()
 
                             empresa_info = f'\n🏢 Empresa: {empresa}' if empresa else ''
                             cnpj_info = f'\n📋 CNPJ: {cnpj}' if cnpj else ''
@@ -1171,6 +1266,7 @@ async def check_alerts(context):
                     kw = match_alert(sender, subject)
                     if kw:
                         _alerted_ids.add(uid)
+                        _rset('alerted_ids', list(_alerted_ids))
                         name = sender.split('<')[0].strip().strip('"') or sender
                         hora = datetime.now().strftime('%H:%M')
                         msg_tg = (
@@ -1384,6 +1480,8 @@ def scan_inbox_for_parecer():
                 }
                 _alerted_ids.add(uid)
                 found += 1
+            persist_parecer_pending()
+            _rset('alerted_ids', list(_alerted_ids))
             mail.logout()
         except Exception as e:
             print(f'scan_inbox_for_parecer [{acc["user"]}]: {e}')
@@ -1399,18 +1497,20 @@ async def cmd_gerar_parecer(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text('🔍 Varrendo emails não lidos em busca de solicitações...')
         found = scan_inbox_for_parecer()
         if not found:
-            # Usa o email exibido na conversa como base do parecer
-            if _last_shown_email:
-                uid = f"context:{id(_last_shown_email)}"
+            # Usa o email exibido na conversa (memória Redis) como base
+            ctx_email = _last_shown_email or _rget('last_email')
+            if ctx_email:
+                uid = f"context:{hash(ctx_email.get('subject',''))}"
                 _parecer_pending[uid] = {
-                    **_last_shown_email,
-                    'empresa': _last_shown_email.get('empresa') or _last_shown_email['sender'].split('<')[0].strip().strip('"'),
-                    'cnpj': _last_shown_email.get('cnpj', ''),
+                    **ctx_email,
+                    'empresa': ctx_email.get('empresa') or ctx_email['sender'].split('<')[0].strip().strip('"'),
+                    'cnpj': ctx_email.get('cnpj', ''),
                 }
+                persist_parecer_pending()
                 await update.message.reply_text(
-                    f'📧 Usando o email da conversa:\n'
-                    f'📌 {_last_shown_email["subject"]}\n'
-                    f'↳ {_last_shown_email["sender"]}'
+                    f'📧 Usando o email da memória:\n'
+                    f'📌 {ctx_email["subject"]}\n'
+                    f'↳ {ctx_email["sender"]}'
                 )
             else:
                 await update.message.reply_text(
@@ -1545,16 +1645,15 @@ async def _gerar_e_salvar(context, fid, flow):
         flow['pdf_bytes'] = pdf_bytes
         flow['state'] = 'await_auth'
 
-        # Salva globalmente para reenvio posterior
-        global _last_parecer
-        _last_parecer = {
+        # Salva globalmente + Redis para reenvio posterior
+        persist_last_parecer({
             'base_filename': base_filename,
             'pdf_bytes': pdf_bytes,
             'pdf_url': pdf_url,
             'docx_url': docx_url,
             'empresa': empresa,
             'email_data': email_data,
-        }
+        })
 
         # Envia PDF primeiro — usuário vê antes de decidir
         if pdf_bytes:
@@ -1586,6 +1685,7 @@ async def _gerar_e_salvar(context, fid, flow):
         )
 
         _parecer_pending.pop(flow.get('uid'), None)
+        persist_parecer_pending()
 
     except Exception as e:
         await context.bot.send_message(chat_id=CHAT_ID, text=f'❌ Erro ao processar parecer: {e}')
@@ -1787,7 +1887,7 @@ async def _execute_tool(tool_name, tool_input, update, context):
         if not data:
             await update.message.reply_text(f'📭 Nenhum email encontrado de "{nome}".')
         else:
-            _last_shown_email = data  # salva contexto para parecer
+            persist_last_email(data)
             await update.message.reply_text(
                 f'📧 De: {data["sender"]}\n'
                 f'📌 Assunto: {data["subject"]}\n'
@@ -1802,7 +1902,7 @@ async def _execute_tool(tool_name, tool_input, update, context):
         if not data:
             await update.message.reply_text(f'📭 Nenhum email encontrado de "{nome}".')
         else:
-            _last_shown_email = data  # salva contexto para parecer
+            persist_last_email(data)
             await update.message.reply_text('⏳ Analisando com IA...')
             analysis = analyze_with_claude(data)
             await update.message.reply_text(analysis)
@@ -1839,10 +1939,10 @@ async def _execute_tool(tool_name, tool_input, update, context):
 
     elif tool_name == 'reenviar_pdf':
         from telegram import InputFile
-        if not _last_parecer or not _last_parecer.get('pdf_bytes'):
-            await update.message.reply_text('📭 Nenhum parecer gerado nesta sessão.')
+        p = get_last_parecer()
+        if not p or not p.get('pdf_bytes'):
+            await update.message.reply_text('📭 Nenhum parecer encontrado. Gere um novo com "elabora o parecer".')
             return
-        p = _last_parecer
         # Reenvia PDF no Telegram
         await context.bot.send_document(
             chat_id=CHAT_ID,
@@ -1952,6 +2052,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ─── MAIN ────────────────────────────────────────────────────────────────────
 
 def main():
+    load_state_from_redis()
+
     app = Application.builder().token(TELEGRAM_TOKEN).build()
 
     # Monitoramento automático a cada 10 minutos
