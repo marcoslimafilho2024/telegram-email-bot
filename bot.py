@@ -257,6 +257,7 @@ _parecer_pending = {}
 _flow_counter = 0
 _parecer_flow = {}        # fid -> state dict
 _flow_folders_cache = {}  # fid -> [(name, id), ...]
+_last_shown_email = None  # último email exibido na conversa (contexto)
 
 # ─── DETECÇÃO DE SOLICITAÇÕES DE PARECER ─────────────────────────────────────
 # Palavras no ASSUNTO que sugerem consulta tributária/fiscal
@@ -1384,12 +1385,27 @@ async def cmd_gerar_parecer(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text('🔍 Varrendo emails não lidos em busca de solicitações...')
         found = scan_inbox_for_parecer()
         if not found:
-            await update.message.reply_text(
-                '📭 Nenhuma solicitação de parecer encontrada nos emails não lidos.\n\n'
-                'O bot busca assuntos como: fiscal, tributário, consulta, análise, orientação, parecer...'
-            )
-            return
-        await update.message.reply_text(f'✅ {found} solicitação(ões) encontrada(s)!')
+            # Usa o email exibido na conversa como base do parecer
+            if _last_shown_email:
+                uid = f"context:{id(_last_shown_email)}"
+                _parecer_pending[uid] = {
+                    **_last_shown_email,
+                    'empresa': _last_shown_email.get('empresa') or _last_shown_email['sender'].split('<')[0].strip().strip('"'),
+                    'cnpj': _last_shown_email.get('cnpj', ''),
+                }
+                await update.message.reply_text(
+                    f'📧 Usando o email da conversa:\n'
+                    f'📌 {_last_shown_email["subject"]}\n'
+                    f'↳ {_last_shown_email["sender"]}'
+                )
+            else:
+                await update.message.reply_text(
+                    '📭 Nenhum email encontrado para o parecer.\n\n'
+                    'Primeiro mostre um email ("me mostre o email da Ingrid") e depois peça o parecer.'
+                )
+                return
+        else:
+            await update.message.reply_text(f'✅ {found} solicitação(ões) encontrada(s)!')
 
     uid, email_data = list(_parecer_pending.items())[-1]
 
@@ -1703,6 +1719,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def _execute_tool(tool_name, tool_input, update, context):
     """Executa a ferramenta escolhida pelo Claude e retorna texto do resultado."""
+    global _last_shown_email
     periodo_map = {'hoje': 24, 'semana': 168, 'tudo': None}
 
     if tool_name == 'ver_emails':
@@ -1735,6 +1752,7 @@ async def _execute_tool(tool_name, tool_input, update, context):
         if not data:
             await update.message.reply_text(f'📭 Nenhum email encontrado de "{nome}".')
         else:
+            _last_shown_email = data  # salva contexto para parecer
             await update.message.reply_text(
                 f'📧 De: {data["sender"]}\n'
                 f'📌 Assunto: {data["subject"]}\n'
@@ -1749,6 +1767,7 @@ async def _execute_tool(tool_name, tool_input, update, context):
         if not data:
             await update.message.reply_text(f'📭 Nenhum email encontrado de "{nome}".')
         else:
+            _last_shown_email = data  # salva contexto para parecer
             await update.message.reply_text('⏳ Analisando com IA...')
             analysis = analyze_with_claude(data)
             await update.message.reply_text(analysis)
@@ -1825,7 +1844,14 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context_note = ''
     if _parecer_pending:
         n = len(_parecer_pending)
-        context_note = f'\n\n[Contexto: {n} solicitação(ões) de parecer pendente(s) na fila.]'
+        context_note += f'\n\n[Contexto: {n} solicitação(ões) de parecer pendente(s) na fila.]'
+    if _last_shown_email:
+        context_note += (
+            f'\n\n[Último email exibido na conversa: '
+            f'De "{_last_shown_email["sender"]}" | '
+            f'Assunto: "{_last_shown_email["subject"]}". '
+            f'Se o usuário pedir parecer sem especificar outro email, use este como base.]'
+        )
 
     try:
         response = claude_client.messages.create(
