@@ -567,6 +567,40 @@ def fetch_emails(hours=None, only_cat=None, limit=100):
         return None, 0, 0, str(e)
 
 
+def fetch_by_sender(hours=None, limit=300):
+    """Retorna lista de (nome, email, count, categoria) dos remetentes com mais emails não lidos."""
+    try:
+        from collections import defaultdict, Counter
+        sender_counts = Counter()
+        sender_meta = {}  # email_addr -> (nome_display, categoria)
+        spam_count = 0
+        for acc in ACCOUNTS:
+            mail = get_imap(acc['user'], acc['password'], readonly=True)
+            ids = search_unseen(mail, hours)
+            for eid, sender, subject in fetch_headers(mail, ids, limit):
+                if is_spam(sender, subject):
+                    spam_count += 1
+                    continue
+                # Extrai nome e endereço
+                m = re.match(r'^(.*?)\s*<([^>]+)>', sender)
+                if m:
+                    nome = m.group(1).strip().strip('"') or m.group(2)
+                    addr = m.group(2).lower()
+                else:
+                    nome = sender.strip()
+                    addr = sender.lower()
+                cat = classify(sender, subject)
+                sender_counts[addr] += 1
+                if addr not in sender_meta:
+                    sender_meta[addr] = (nome[:40], cat)
+            mail.logout()
+        ranked = sorted(sender_counts.items(), key=lambda x: x[1], reverse=True)
+        result = [(sender_meta[addr][0], addr, count, sender_meta[addr][1]) for addr, count in ranked]
+        return result, spam_count, None
+    except Exception as e:
+        return [], 0, str(e)
+
+
 def count_by_category(hours=None, limit=500):
     try:
         total_all = 0
@@ -942,6 +976,41 @@ async def cmd_gerar_parecer(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 @only_authorized
+async def cmd_remetentes(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Lista os remetentes com mais emails não lidos, agrupados por quantidade."""
+    text = update.message.text.lower()
+    # Detecta se pediu filtro de tempo
+    if 'hoje' in text or '24h' in text:
+        hours, periodo = 24, 'hoje'
+    elif 'semana' in text:
+        hours, periodo = 168, 'semana'
+    else:
+        hours, periodo = None, 'caixa toda'
+
+    await update.message.reply_text(f'🔍 Mapeando remetentes ({periodo})...')
+    result, spam_count, err = fetch_by_sender(hours=hours, limit=300)
+    if err:
+        await update.message.reply_text(f'❌ Erro: {err}')
+        return
+    if not result:
+        await update.message.reply_text('📭 Nenhum email não lido.')
+        return
+
+    total_emails = sum(c for _, _, c, _ in result)
+    lines = [f'👥 REMETENTES — {len(result)} únicos, {total_emails} emails ({periodo})\n']
+    for nome, addr, count, cat in result[:25]:
+        icon = ICONS.get(cat, '📌')
+        bar = '█' * min(count, 10) + ('…' if count > 10 else '')
+        lines.append(f'{icon} {bar} {count}x  {nome}\n   {addr}')
+
+    if len(result) > 25:
+        lines.append(f'\n... e mais {len(result) - 25} remetentes')
+    lines.append(f'\n🗑️ Spam/propaganda ignorado: {spam_count}')
+
+    await update.message.reply_text('\n'.join(lines))
+
+
+@only_authorized
 async def cmd_pessoal_gmail(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Lê somente a conta pessoal cnp.marcoslima@gmail.com"""
     pessoal = next((a for a in ACCOUNTS if 'cnp' in a['user']), None)
@@ -1026,6 +1095,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         '👨‍💼 "ver profissional" — jurídico/tributário\n'
         '💳 "ver financeiro" — XP, Pix, banco\n'
         '👦 "email do davi?" — pessoal/escola\n'
+        '👥 "quem mais manda email?" — ranking por remetente\n'
         '🚨 "ver alertas" — palavras monitoradas\n'
         '✅ "zera a caixa" — marca tudo como lido\n\n'
         '🔔 Monitoramento automático ativo a cada 10 min!\n'
@@ -1096,6 +1166,14 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         'elaborar parecer', 'monta o parecer', 'gera o parecer',
     ]):
         await cmd_gerar_parecer(update, context)
+
+    elif any(w in text for w in [
+        'remetente', 'remetentes', 'quem mandou', 'quem enviou',
+        'por remetente', 'por pessoa', 'quem mais manda', 'quem mais envia',
+        'ranking', 'quem é importante', 'mapa de contatos', 'frequência',
+        'frequencia', 'quem aparece mais',
+    ]):
+        await cmd_remetentes(update, context)
 
     elif any(w in text for w in [
         'email do', 'email da', 'email de', 'analisar email',
@@ -1170,6 +1248,7 @@ def main():
     app.add_handler(CommandHandler('pessoal', cmd_pessoal))
     app.add_handler(CommandHandler('analisar', cmd_analisar_email))
     app.add_handler(CommandHandler('parecer', cmd_gerar_parecer))
+    app.add_handler(CommandHandler('remetentes', cmd_remetentes))
     app.add_handler(CommandHandler('cnp', cmd_pessoal_gmail))
     app.add_handler(CommandHandler('varredura', cmd_varredura))
     app.add_handler(CommandHandler('alertas', cmd_alertas))
