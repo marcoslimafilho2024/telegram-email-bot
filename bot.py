@@ -470,36 +470,63 @@ def get_email_body(msg):
 
 
 def search_email_by_name(name_query):
-    """Busca o email mais recente de um remetente pelo nome."""
+    """Busca email de um remetente priorizando não lidos, depois mais recente."""
     for acc in ACCOUNTS:
         try:
             mail = get_imap(acc['user'], acc['password'], readonly=True)
+
+            def _fetch_result(eid):
+                _, msg_data = mail.fetch(eid, '(BODY.PEEK[])')
+                msg = email.message_from_bytes(msg_data[0][1])
+                return {
+                    'sender': decode_str(msg.get('From', '')),
+                    'subject': decode_str(msg.get('Subject', '')),
+                    'date': decode_str(msg.get('Date', '')),
+                    'body': get_email_body(msg),
+                    'account': acc['label'],
+                }
+
+            # 1. Tenta não lidos do remetente (prioridade máxima)
+            _, data = mail.search(None, f'(UNSEEN FROM "{name_query}")')
+            unseen_ids = data[0].split()
+            if unseen_ids:
+                result = _fetch_result(unseen_ids[-1])
+                mail.logout()
+                return result
+
+            # 2. Busca qualquer email do remetente (lido ou não)
             _, data = mail.search(None, f'(FROM "{name_query}")')
             ids = data[0].split()
+
+            # 3. Busca parcial nos últimos 200 se não achou pelo FROM direto
             if not ids:
-                # Tenta busca parcial por palavra
                 _, data = mail.search(None, 'ALL')
                 all_ids = data[0].split()
-                # Pega os últimos 200 e filtra por nome
+
+                # Sub-busca: não lidos primeiro
+                _, unseen_data = mail.search(None, 'UNSEEN')
+                unseen_set = set(unseen_data[0].split())
+
+                candidates = []
                 for eid in reversed(all_ids[-200:]):
-                    _, msg_data = mail.fetch(eid, '(BODY.PEEK[HEADER.FIELDS (FROM SUBJECT DATE)])')
-                    raw = msg_data[0][1]
-                    msg = email.message_from_bytes(raw)
-                    sender = decode_str(msg.get('From', ''))
+                    _, hdr = mail.fetch(eid, '(BODY.PEEK[HEADER.FIELDS (FROM)])')
+                    sender = decode_str(email.message_from_bytes(hdr[0][1]).get('From', ''))
                     if name_query.lower() in sender.lower():
-                        ids = [eid]
-                        break
+                        candidates.append((eid, eid in unseen_set))
+
+                if candidates:
+                    # Prefere não lido; se todos lidos, pega o primeiro (mais recente)
+                    unread = [eid for eid, is_unseen in candidates if is_unseen]
+                    chosen = unread[0] if unread else candidates[0][0]
+                    result = _fetch_result(chosen)
+                    mail.logout()
+                    return result
+
             if ids:
-                eid = ids[-1]  # mais recente
-                _, msg_data = mail.fetch(eid, '(BODY.PEEK[])')
-                raw = msg_data[0][1]
-                msg = email.message_from_bytes(raw)
-                sender = decode_str(msg.get('From', ''))
-                subject = decode_str(msg.get('Subject', ''))
-                date = decode_str(msg.get('Date', ''))
-                body = get_email_body(msg)
+                result = _fetch_result(ids[-1])
                 mail.logout()
-                return {'sender': sender, 'subject': subject, 'date': date, 'body': body, 'account': acc['label']}
+                return result
+
             mail.logout()
         except Exception as e:
             print(f'Erro search_email_by_name: {e}')
