@@ -1214,17 +1214,65 @@ async def cmd_analisar_email(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await update.message.reply_text(analysis)
 
 
+def scan_inbox_for_parecer():
+    """Varre emails NÃO LIDOS buscando solicitações de parecer ainda não detectadas.
+    Adiciona novos candidatos a _parecer_pending. Retorna quantidade encontrada.
+    """
+    found = 0
+    for acc in ACCOUNTS:
+        try:
+            mail = get_imap(acc['user'], acc['password'], readonly=True)
+            _, data = mail.search(None, 'UNSEEN')
+            ids = data[0].split()
+            for eid in ids[-100:]:
+                uid = f"{acc['user']}:{eid}"
+                if uid in _parecer_pending or uid in _alerted_ids:
+                    continue
+                _, msg_data = mail.fetch(eid, '(BODY.PEEK[HEADER.FIELDS (FROM SUBJECT)])')
+                raw = msg_data[0][1]
+                msg = email.message_from_bytes(raw)
+                sender = decode_str(msg.get('From', ''))
+                subject = decode_str(msg.get('Subject', ''))
+                if not match_parecer_subject(subject):
+                    continue
+                _, full_data = mail.fetch(eid, '(BODY.PEEK[])')
+                full_msg = email.message_from_bytes(full_data[0][1])
+                body = get_email_body(full_msg)
+                if not match_parecer_body(body):
+                    continue
+                empresa, cnpj = extract_empresa_cnpj(body)
+                _parecer_pending[uid] = {
+                    'sender': sender,
+                    'subject': subject,
+                    'body': body,
+                    'date': decode_str(full_msg.get('Date', '')),
+                    'empresa': empresa or 'Cliente',
+                    'cnpj': cnpj or '',
+                    'account': acc['label'],
+                }
+                _alerted_ids.add(uid)
+                found += 1
+            mail.logout()
+        except Exception as e:
+            print(f'scan_inbox_for_parecer [{acc["user"]}]: {e}')
+    return found
+
+
 @only_authorized
 async def cmd_gerar_parecer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Inicia o fluxo interativo de geração de parecer."""
     global _flow_counter
 
     if not _parecer_pending:
-        await update.message.reply_text(
-            '📭 Nenhuma solicitação de parecer pendente.\n\n'
-            'O bot detecta automaticamente emails pedindo orientação/análise tributária.'
-        )
-        return
+        await update.message.reply_text('🔍 Varrendo emails não lidos em busca de solicitações...')
+        found = scan_inbox_for_parecer()
+        if not found:
+            await update.message.reply_text(
+                '📭 Nenhuma solicitação de parecer encontrada nos emails não lidos.\n\n'
+                'O bot busca assuntos como: fiscal, tributário, consulta, análise, orientação, parecer...'
+            )
+            return
+        await update.message.reply_text(f'✅ {found} solicitação(ões) encontrada(s)!')
 
     uid, email_data = list(_parecer_pending.items())[-1]
 
