@@ -205,6 +205,19 @@ CLAUDE_TOOLS = [
         "description": "Marca todos os emails não lidos como lidos. Use para 'zera a caixa', 'marcar tudo como lido'.",
         "input_schema": {"type": "object", "properties": {}}
     },
+    {
+        "name": "reenviar_pdf",
+        "description": "Reenvia o PDF do último parecer gerado como documento no Telegram, e/ou envia por email. Use quando o usuário pedir 'quero ver o pdf', 'me manda o parecer', 'envia o parecer', 'mostra o pdf'.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "enviar_email": {
+                    "type": "boolean",
+                    "description": "Se true, também envia por email para o remetente original"
+                }
+            }
+        }
+    },
 ]
 
 ANTHROPIC_API_KEY = os.environ.get('ANTHROPIC_API_KEY', '')
@@ -258,6 +271,7 @@ _flow_counter = 0
 _parecer_flow = {}        # fid -> state dict
 _flow_folders_cache = {}  # fid -> [(name, id), ...]
 _last_shown_email = None  # último email exibido na conversa (contexto)
+_last_parecer = None      # último parecer gerado (pdf_bytes, urls, filename)
 
 # ─── DETECÇÃO DE SOLICITAÇÕES DE PARECER ─────────────────────────────────────
 # Palavras no ASSUNTO que sugerem consulta tributária/fiscal
@@ -1488,8 +1502,16 @@ async def handle_callback_query(update, context):
         await _enviar_email_resposta(query, context, fid, flow)
 
     elif action == 'ac':
+        pdf_url = flow.get('pdf_url', '')
+        docx_url = flow.get('docx_url', '')
         _parecer_flow.pop(fid, None)
-        await query.edit_message_text('✅ Parecer salvo no Drive. Envio por email cancelado.')
+        lines = ['💾 Parecer salvo no Drive. Email não enviado.\n',
+                 'Para enviar depois, responda "envia o parecer".\n']
+        if pdf_url:
+            lines.append(f'📑 PDF: {pdf_url}')
+        if docx_url:
+            lines.append(f'📄 DOCX: {docx_url}')
+        await query.edit_message_text('\n'.join(lines))
 
 
 async def _gerar_e_salvar(context, fid, flow):
@@ -1523,6 +1545,25 @@ async def _gerar_e_salvar(context, fid, flow):
         flow['pdf_bytes'] = pdf_bytes
         flow['state'] = 'await_auth'
 
+        # Salva globalmente para reenvio posterior
+        global _last_parecer
+        _last_parecer = {
+            'base_filename': base_filename,
+            'pdf_bytes': pdf_bytes,
+            'pdf_url': pdf_url,
+            'docx_url': docx_url,
+            'empresa': empresa,
+            'email_data': email_data,
+        }
+
+        # Envia PDF primeiro — usuário vê antes de decidir
+        if pdf_bytes:
+            await context.bot.send_document(
+                chat_id=CHAT_ID,
+                document=InputFile(_io_module.BytesIO(pdf_bytes), filename=base_filename + '.pdf'),
+                caption=f'📑 {base_filename}.pdf — revise antes de autorizar o envio'
+            )
+
         lines = [
             f'✅ PARECER GERADO — {modelo}\n',
             f'🏢 {empresa}' + (f'  |  CNPJ: {cnpj}' if cnpj else ''),
@@ -1532,23 +1573,17 @@ async def _gerar_e_salvar(context, fid, flow):
             lines.append(f'📄 DOCX: {docx_url}')
         if pdf_url:
             lines.append(f'📑 PDF: {pdf_url}')
+        lines.append('\nRevise o PDF acima e decida:')
 
         buttons = [
             [InlineKeyboardButton('✅ Autorizar envio por email', callback_data=f'as:{fid}')],
-            [InlineKeyboardButton('❌ Não enviar', callback_data=f'ac:{fid}')],
+            [InlineKeyboardButton('💾 Salvar só no Drive', callback_data=f'ac:{fid}')],
         ]
         await context.bot.send_message(
             chat_id=CHAT_ID,
             text='\n'.join(lines),
             reply_markup=InlineKeyboardMarkup(buttons)
         )
-
-        if pdf_bytes:
-            await context.bot.send_document(
-                chat_id=CHAT_ID,
-                document=InputFile(_io_module.BytesIO(pdf_bytes), filename=base_filename + '.pdf'),
-                caption=f'📑 {base_filename}.pdf'
-            )
 
         _parecer_pending.pop(flow.get('uid'), None)
 
@@ -1802,6 +1837,38 @@ async def _execute_tool(tool_name, tool_input, update, context):
             f'✅ {total} email(s) marcados como lidos.' if total >= 0 else '❌ Erro ao marcar emails.'
         )
 
+    elif tool_name == 'reenviar_pdf':
+        from telegram import InputFile
+        if not _last_parecer or not _last_parecer.get('pdf_bytes'):
+            await update.message.reply_text('📭 Nenhum parecer gerado nesta sessão.')
+            return
+        p = _last_parecer
+        # Reenvia PDF no Telegram
+        await context.bot.send_document(
+            chat_id=CHAT_ID,
+            document=InputFile(_io_module.BytesIO(p['pdf_bytes']), filename=p['base_filename'] + '.pdf'),
+            caption=f'📑 {p["base_filename"]}.pdf'
+        )
+        lines = []
+        if p.get('pdf_url'):
+            lines.append(f'📑 Drive: {p["pdf_url"]}')
+        if p.get('docx_url'):
+            lines.append(f'📄 DOCX: {p["docx_url"]}')
+        if lines:
+            await update.message.reply_text('\n'.join(lines))
+        # Envia por email se solicitado
+        if tool_input.get('enviar_email') and p.get('email_data'):
+            summary = (
+                f'Prezado(a),\n\nSegue o parecer técnico da Compliance-CE '
+                f'referente a: {p["email_data"]["subject"]}.\n\n'
+                f'Atenciosamente,\nMarcos Lima — CRC/CE\nCompliance-CE'
+            )
+            ok, err = reply_email_with_pdf(p['email_data'], p['pdf_bytes'], p['base_filename'], summary)
+            await update.message.reply_text(
+                f'✅ Email enviado para {p["email_data"]["sender"]}' if ok
+                else f'❌ Falha ao enviar email: {err}'
+            )
+
 
 @only_authorized
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1847,10 +1914,16 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context_note += f'\n\n[Contexto: {n} solicitação(ões) de parecer pendente(s) na fila.]'
     if _last_shown_email:
         context_note += (
-            f'\n\n[Último email exibido na conversa: '
+            f'\n\n[Último email exibido: '
             f'De "{_last_shown_email["sender"]}" | '
             f'Assunto: "{_last_shown_email["subject"]}". '
             f'Se o usuário pedir parecer sem especificar outro email, use este como base.]'
+        )
+    if _last_parecer:
+        context_note += (
+            f'\n\n[Último parecer gerado: "{_last_parecer["base_filename"]}" '
+            f'para {_last_parecer["empresa"]}. '
+            f'Se o usuário quiser ver o PDF ou enviar por email, use a ferramenta reenviar_pdf.]'
         )
 
     try:
