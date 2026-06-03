@@ -4,6 +4,7 @@ import email
 import json
 import re
 import smtplib
+import requests
 from email.header import decode_header
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -117,6 +118,12 @@ ICONS = {
 ANTHROPIC_API_KEY = os.environ.get('ANTHROPIC_API_KEY', '')
 claude_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY) if ANTHROPIC_API_KEY else None
 
+# ─── TRELLO ───────────────────────────────────────────────────────────────────
+TRELLO_API_KEY = os.environ.get('TRELLO_API_KEY', '')
+TRELLO_TOKEN = os.environ.get('TRELLO_TOKEN', '')
+TRELLO_MESA1_LIST_ID = os.environ.get('TRELLO_MESA1_LIST_ID', '')
+TRELLO_LABEL_URGENTE_ID = os.environ.get('TRELLO_LABEL_URGENTE_ID', '')
+
 # ─── REGRAS AUTOMÁTICAS ───────────────────────────────────────────────────────
 # Quando email bate numa regra: alerta Telegram + encaminha automaticamente
 
@@ -126,11 +133,20 @@ RULES = [
         'match_from': ['nf@ipog.edu.br', 'ipog.edu.br'],
         'match_subject': ['solicitação nf', 'solicitacao nf', 'nota fiscal', 'nf semana'],
         'forward_to': ['vanessa2mlima@gmail.com', 'vanessalima@compliance-ce.com.br'],
-        'forward_from_account': 'cnp',   # qual conta encaminhar (cnp = pessoal)
+        'forward_from_account': 'cnp',
         'alert_msg': '🚨 IPOG — Solicitação de NF recebida!\nEncaminhado para Vanessa automaticamente.',
         'priority': 'URGENTE',
     },
-    # Adicione mais regras aqui no futuro
+    {
+        'name': 'Sherman Alcantara — Fortes Tecnologia',
+        'match_from': ['shermanalcantara@fortestecnologia.com.br'],
+        'match_subject': [],   # qualquer assunto
+        'match_logic': 'or',   # basta o remetente bater
+        'action': 'trello_card',
+        'trello_list_id': TRELLO_MESA1_LIST_ID,
+        'alert_msg': '🚨 SHERMAN (Fortes) — Card criado na Mesa de Execução 1!',
+        'priority': 'URGENTE',
+    },
 ]
 
 # Controle de IDs já processados por regras (evita repetição)
@@ -168,6 +184,40 @@ PARECER_BODY_KEYWORDS = [
     'estrutura tributária', 'estrutura tributaria',
     'icms-st', 'cnae adequado', 'obrigações tributárias', 'obrigacoes tributarias',
 ]
+
+
+# ─── TRELLO HELPER ───────────────────────────────────────────────────────────
+
+def create_trello_card_urgent(subject, sender, body_preview, list_id=None):
+    """Cria card no Trello no topo da lista com label URGENTE."""
+    if not TRELLO_API_KEY or not TRELLO_TOKEN:
+        return None, 'TRELLO_API_KEY/TRELLO_TOKEN não configurados'
+    lid = list_id or TRELLO_MESA1_LIST_ID
+    if not lid:
+        return None, 'TRELLO_MESA1_LIST_ID não configurado'
+
+    name_display = sender.split('<')[0].strip().strip('"') or sender
+    card_name = f'[FORTES] {subject[:90]}' if subject else f'[FORTES] Email de {name_display}'
+    desc = f'**Remetente:** {sender}\n**Assunto:** {subject}\n\n{body_preview[:800]}'
+
+    params = {
+        'key': TRELLO_API_KEY,
+        'token': TRELLO_TOKEN,
+        'idList': lid,
+        'name': card_name,
+        'desc': desc,
+        'pos': 'top',
+    }
+    if TRELLO_LABEL_URGENTE_ID:
+        params['idLabels'] = TRELLO_LABEL_URGENTE_ID
+
+    try:
+        resp = requests.post('https://api.trello.com/1/cards', params=params, timeout=10)
+        resp.raise_for_status()
+        card = resp.json()
+        return card.get('shortUrl'), None
+    except Exception as e:
+        return None, str(e)
 
 
 # ─── HELPERS ─────────────────────────────────────────────────────────────────
@@ -680,13 +730,27 @@ async def check_alerts(context):
                     _rule_processed_ids.add(uid)
                     _, full_data = mail.fetch(eid, '(BODY.PEEK[])')
                     full_raw = full_data[0][1]
-                    ok, err_msg = forward_email(full_raw, rule, acc)
                     hora = datetime.now().strftime('%H:%M')
-                    destinos = '\n'.join(f'  • {d}' for d in rule['forward_to'])
-                    if ok:
-                        detail = f'✅ Encaminhado para:\n{destinos}'
+
+                    action = rule.get('action', 'forward')
+
+                    if action == 'trello_card':
+                        full_msg = email.message_from_bytes(full_raw)
+                        body = get_email_body(full_msg)
+                        lid = rule.get('trello_list_id') or TRELLO_MESA1_LIST_ID
+                        card_url, err_msg = create_trello_card_urgent(subject, sender, body, list_id=lid)
+                        if card_url:
+                            detail = f'✅ Card criado no topo (URGENTE):\n{card_url}'
+                        else:
+                            detail = f'❌ Falha ao criar card Trello\n⚠️ {(err_msg or "erro desconhecido")[:300]}'
                     else:
-                        detail = f'❌ Falha ao encaminhar para:\n{destinos}\n\n⚠️ Erro: {(err_msg or "desconhecido")[:300]}'
+                        ok, err_msg = forward_email(full_raw, rule, acc)
+                        destinos = '\n'.join(f'  • {d}' for d in rule['forward_to'])
+                        if ok:
+                            detail = f'✅ Encaminhado para:\n{destinos}'
+                        else:
+                            detail = f'❌ Falha ao encaminhar para:\n{destinos}\n\n⚠️ Erro: {(err_msg or "desconhecido")[:300]}'
+
                     msg_tg = (
                         f'{rule["alert_msg"]}\n\n'
                         f'📧 {subject}\n'
