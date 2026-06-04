@@ -953,15 +953,28 @@ def _drive_service():
 
 
 def list_drive_subfolders(parent_id):
+    """Lista TODAS as subpastas usando paginação do Drive API."""
     svc = _drive_service()
     if not svc:
         return []
     try:
-        res = svc.files().list(
-            q=f"'{parent_id}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false",
-            fields='files(id,name)', orderBy='name'
-        ).execute()
-        return [(f['name'], f['id']) for f in res.get('files', [])]
+        folders = []
+        page_token = None
+        while True:
+            kwargs = dict(
+                q=f"'{parent_id}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false",
+                fields='nextPageToken, files(id,name)',
+                orderBy='name',
+                pageSize=100,
+            )
+            if page_token:
+                kwargs['pageToken'] = page_token
+            res = svc.files().list(**kwargs).execute()
+            folders.extend([(f['name'], f['id']) for f in res.get('files', [])])
+            page_token = res.get('nextPageToken')
+            if not page_token:
+                break
+        return folders
     except Exception as e:
         print(f'list_drive_subfolders: {e}')
         return []
@@ -1535,7 +1548,7 @@ async def cmd_gerar_parecer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     from telegram import InlineKeyboardButton, InlineKeyboardMarkup
     buttons = [
         [InlineKeyboardButton(f'📁 {name[:45]}', callback_data=f'fs:{fid}:{idx}')]
-        for idx, (name, _) in enumerate(folders[:8])
+        for idx, (name, _) in enumerate(folders)
     ]
     buttons.append([InlineKeyboardButton('➕ Criar nova pasta', callback_data=f'fn:{fid}')])
 
