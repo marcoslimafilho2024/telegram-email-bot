@@ -328,10 +328,13 @@ def persist_last_parecer(data):
     global _last_parecer
     _last_parecer = data
     pdf = data.get('pdf_bytes')
-    meta = {k: v for k, v in data.items() if k != 'pdf_bytes'}
+    docx = data.get('docx_bytes')
+    meta = {k: v for k, v in data.items() if k not in ('pdf_bytes', 'docx_bytes')}
     _rset('last_parecer_meta', meta)
     if pdf:
         _rset_bytes('last_parecer_pdf', pdf)
+    if docx:
+        _rset_bytes('last_parecer_docx', docx)
 
 def get_last_parecer():
     if _last_parecer:
@@ -340,7 +343,8 @@ def get_last_parecer():
     if not meta:
         return None
     pdf = _rget_bytes('last_parecer_pdf')
-    return {**meta, 'pdf_bytes': pdf}
+    docx = _rget_bytes('last_parecer_docx')
+    return {**meta, 'pdf_bytes': pdf, 'docx_bytes': docx}
 
 def persist_parecer_pending():
     _rset('parecer_pending', _parecer_pending)
@@ -994,14 +998,17 @@ def create_drive_folder(name, parent_id):
 
 
 def upload_docx_and_pdf(docx_bytes, base_filename, folder_id):
-    """Uploads .docx + converts to .pdf via Google Docs. Returns (docx_url, pdf_url, pdf_bytes)."""
+    """Uploads .docx + converts to .pdf via Google Docs. Returns (docx_url, pdf_url, pdf_bytes).
+    If PDF export fails, returns (docx_url, None, None) so DOCX is at least accessible."""
     svc = _drive_service()
     if not svc:
         return None, None, None
     from googleapiclient.http import MediaIoBaseUpload, MediaIoBaseDownload
     DOCX_MIME = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+
+    # Step 1: Upload DOCX (isolated — failure here aborts everything)
+    docx_url = None
     try:
-        # Upload DOCX
         docx_meta = {'name': base_filename + '.docx', 'parents': [folder_id]}
         docx_file = svc.files().create(
             body=docx_meta,
@@ -1009,8 +1016,14 @@ def upload_docx_and_pdf(docx_bytes, base_filename, folder_id):
             fields='id,webViewLink'
         ).execute()
         docx_url = docx_file.get('webViewLink', '')
+    except Exception as e:
+        print(f'upload_docx error: {e}')
+        return None, None, None
 
-        # Upload as Google Doc (for PDF export)
+    # Step 2: PDF export via Google Docs (failure is non-fatal — DOCX already saved)
+    pdf_url = None
+    pdf_bytes_out = None
+    try:
         gdoc_meta = {'name': base_filename + '_tmp', 'parents': [folder_id],
                      'mimeType': 'application/vnd.google-apps.document'}
         gdoc = svc.files().create(
@@ -1020,34 +1033,30 @@ def upload_docx_and_pdf(docx_bytes, base_filename, folder_id):
         ).execute()
         gdoc_id = gdoc['id']
 
-        # Export PDF bytes
         req = svc.files().export_media(fileId=gdoc_id, mimeType='application/pdf')
         pdf_buf = _io_module.BytesIO()
         dl = MediaIoBaseDownload(pdf_buf, req)
         done = False
         while not done:
             _, done = dl.next_chunk()
-        pdf_bytes = pdf_buf.getvalue()
+        pdf_bytes_out = pdf_buf.getvalue()
 
-        # Delete temp Google Doc
         try:
             svc.files().delete(fileId=gdoc_id).execute()
         except Exception:
             pass
 
-        # Upload PDF
         pdf_meta = {'name': base_filename + '.pdf', 'parents': [folder_id]}
         pdf_file = svc.files().create(
             body=pdf_meta,
-            media_body=MediaIoBaseUpload(_io_module.BytesIO(pdf_bytes), mimetype='application/pdf'),
+            media_body=MediaIoBaseUpload(_io_module.BytesIO(pdf_bytes_out), mimetype='application/pdf'),
             fields='id,webViewLink'
         ).execute()
         pdf_url = pdf_file.get('webViewLink', '')
-
-        return docx_url, pdf_url, pdf_bytes
     except Exception as e:
-        print(f'upload_docx_and_pdf: {e}')
-        return None, None, None
+        print(f'pdf_export error (DOCX already saved): {e}')
+
+    return docx_url, pdf_url, pdf_bytes_out
 
 
 def generate_parecer_docx(parecer_text, empresa, cnpj, modelo):
@@ -1618,12 +1627,17 @@ async def handle_callback_query(update, context):
         pdf_url = flow.get('pdf_url', '')
         docx_url = flow.get('docx_url', '')
         _parecer_flow.pop(fid, None)
-        lines = ['💾 Parecer salvo no Drive. Email não enviado.\n',
-                 'Para enviar depois, responda "envia o parecer".\n']
-        if pdf_url:
-            lines.append(f'📑 PDF: {pdf_url}')
-        if docx_url:
-            lines.append(f'📄 DOCX: {docx_url}')
+        if pdf_url or docx_url:
+            lines = ['💾 Parecer salvo no Drive. Email não enviado.\n',
+                     'Para enviar depois, responda "envia o parecer" ou "manda o pdf".\n']
+            if pdf_url:
+                lines.append(f'📑 PDF: {pdf_url}')
+            if docx_url:
+                lines.append(f'📄 DOCX: {docx_url}')
+        else:
+            lines = ['⚠️ Parecer gerado mas não foi possível salvar no Drive.\n',
+                     'O arquivo foi enviado no Telegram acima.\n',
+                     'Para reenviar depois, responda "manda o pdf".']
         await query.edit_message_text('\n'.join(lines))
 
 
@@ -1648,32 +1662,40 @@ async def _gerar_e_salvar(context, fid, flow):
         flow['base_filename'] = base_filename
 
         docx_buf = generate_parecer_docx(parecer_text, empresa, cnpj, modelo)
+        docx_bytes_raw = None
         docx_url, pdf_url, pdf_bytes = None, None, None
         if docx_buf:
-            docx_bytes = docx_buf.read()
-            docx_url, pdf_url, pdf_bytes = upload_docx_and_pdf(docx_bytes, base_filename, flow['folder_id'])
+            docx_bytes_raw = docx_buf.read()
+            docx_url, pdf_url, pdf_bytes = upload_docx_and_pdf(docx_bytes_raw, base_filename, flow['folder_id'])
 
         flow['docx_url'] = docx_url
         flow['pdf_url'] = pdf_url
         flow['pdf_bytes'] = pdf_bytes
         flow['state'] = 'await_auth'
 
-        # Salva globalmente + Redis para reenvio posterior
+        # Salva globalmente + Redis para reenvio posterior (inclui docx_bytes como fallback)
         persist_last_parecer({
             'base_filename': base_filename,
             'pdf_bytes': pdf_bytes,
+            'docx_bytes': docx_bytes_raw,
             'pdf_url': pdf_url,
             'docx_url': docx_url,
             'empresa': empresa,
             'email_data': email_data,
         })
 
-        # Envia PDF primeiro — usuário vê antes de decidir
+        # Envia PDF (ou DOCX como fallback) antes de mostrar os botões
         if pdf_bytes:
             await context.bot.send_document(
                 chat_id=CHAT_ID,
                 document=InputFile(_io_module.BytesIO(pdf_bytes), filename=base_filename + '.pdf'),
                 caption=f'📑 {base_filename}.pdf — revise antes de autorizar o envio'
+            )
+        elif docx_bytes_raw:
+            await context.bot.send_document(
+                chat_id=CHAT_ID,
+                document=InputFile(_io_module.BytesIO(docx_bytes_raw), filename=base_filename + '.docx'),
+                caption=f'⚠️ PDF indisponível (geração falhou). Revise o DOCX antes de autorizar.'
             )
 
         lines = [
@@ -1953,30 +1975,47 @@ async def _execute_tool(tool_name, tool_input, update, context):
     elif tool_name == 'reenviar_pdf':
         from telegram import InputFile
         p = get_last_parecer()
-        if not p or not p.get('pdf_bytes'):
+        if not p:
             await update.message.reply_text('📭 Nenhum parecer encontrado. Gere um novo com "elabora o parecer".')
             return
-        # Reenvia PDF no Telegram
-        await context.bot.send_document(
-            chat_id=CHAT_ID,
-            document=InputFile(_io_module.BytesIO(p['pdf_bytes']), filename=p['base_filename'] + '.pdf'),
-            caption=f'📑 {p["base_filename"]}.pdf'
-        )
+        base_fn = p.get('base_filename', 'PARECER')
+        sent_bytes = None
+        if p.get('pdf_bytes'):
+            await context.bot.send_document(
+                chat_id=CHAT_ID,
+                document=InputFile(_io_module.BytesIO(p['pdf_bytes']), filename=base_fn + '.pdf'),
+                caption=f'📑 {base_fn}.pdf'
+            )
+            sent_bytes = p['pdf_bytes']
+        elif p.get('docx_bytes'):
+            # PDF não disponível — envia DOCX como fallback
+            await context.bot.send_document(
+                chat_id=CHAT_ID,
+                document=InputFile(_io_module.BytesIO(p['docx_bytes']), filename=base_fn + '.docx'),
+                caption=f'⚠️ PDF indisponível. Aqui está o DOCX do parecer: {base_fn}'
+            )
+        elif p.get('pdf_url'):
+            await update.message.reply_text(f'📑 PDF no Drive (não tenho os bytes localmente):\n{p["pdf_url"]}')
+        elif p.get('docx_url'):
+            await update.message.reply_text(f'📄 DOCX no Drive (PDF indisponível):\n{p["docx_url"]}')
+        else:
+            await update.message.reply_text('📭 Não há arquivo disponível para este parecer. Gere um novo com "elabora o parecer".')
+            return
         lines = []
         if p.get('pdf_url'):
-            lines.append(f'📑 Drive: {p["pdf_url"]}')
+            lines.append(f'📑 Drive PDF: {p["pdf_url"]}')
         if p.get('docx_url'):
-            lines.append(f'📄 DOCX: {p["docx_url"]}')
+            lines.append(f'📄 Drive DOCX: {p["docx_url"]}')
         if lines:
             await update.message.reply_text('\n'.join(lines))
-        # Envia por email se solicitado
-        if tool_input.get('enviar_email') and p.get('email_data'):
+        # Envia por email se solicitado e temos bytes de PDF
+        if tool_input.get('enviar_email') and p.get('email_data') and sent_bytes and p.get('pdf_bytes'):
             summary = (
                 f'Prezado(a),\n\nSegue o parecer técnico da Compliance-CE '
                 f'referente a: {p["email_data"]["subject"]}.\n\n'
                 f'Atenciosamente,\nMarcos Lima — CRC/CE\nCompliance-CE'
             )
-            ok, err = reply_email_with_pdf(p['email_data'], p['pdf_bytes'], p['base_filename'], summary)
+            ok, err = reply_email_with_pdf(p['email_data'], p['pdf_bytes'], base_fn, summary)
             await update.message.reply_text(
                 f'✅ Email enviado para {p["email_data"]["sender"]}' if ok
                 else f'❌ Falha ao enviar email: {err}'
