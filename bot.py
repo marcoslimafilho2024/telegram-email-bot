@@ -998,14 +998,15 @@ def create_drive_folder(name, parent_id):
 
 
 def upload_files_to_drive(docx_bytes, pdf_bytes, base_filename, folder_id):
-    """Upload DOCX and/or PDF directly to Drive. Returns (docx_url, pdf_url)."""
+    """Upload DOCX and/or PDF directly to Drive. Returns (docx_url, pdf_url, error_msg)."""
     svc = _drive_service()
     if not svc:
-        return None, None
+        return None, None, 'GOOGLE_SERVICE_ACCOUNT_JSON nao configurado'
     from googleapiclient.http import MediaIoBaseUpload
     DOCX_MIME = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
     docx_url = None
     pdf_url = None
+    last_err = None
     if docx_bytes:
         try:
             docx_meta = {'name': base_filename + '.docx', 'parents': [folder_id]}
@@ -1016,7 +1017,8 @@ def upload_files_to_drive(docx_bytes, pdf_bytes, base_filename, folder_id):
             ).execute()
             docx_url = docx_file.get('webViewLink', '')
         except Exception as e:
-            print(f'upload_docx error: {e}')
+            last_err = f'upload_docx: {e}'
+            print(last_err)
     if pdf_bytes:
         try:
             pdf_meta = {'name': base_filename + '.pdf', 'parents': [folder_id]}
@@ -1027,8 +1029,9 @@ def upload_files_to_drive(docx_bytes, pdf_bytes, base_filename, folder_id):
             ).execute()
             pdf_url = pdf_file.get('webViewLink', '')
         except Exception as e:
-            print(f'upload_pdf error: {e}')
-    return docx_url, pdf_url
+            last_err = f'upload_pdf: {e}'
+            print(last_err)
+    return docx_url, pdf_url, last_err
 
 
 def generate_parecer_docx(parecer_text, empresa, cnpj, modelo):
@@ -1099,6 +1102,27 @@ def generate_parecer_docx(parecer_text, empresa, cnpj, modelo):
     return buf
 
 
+def _sanitize_pdf_text(text):
+    """Replace characters outside CP1252 so fpdf2 core fonts don't fail."""
+    replacements = {
+        '—': '-', '–': '-',   # em dash, en dash
+        '‘': "'", '’': "'",   # curly single quotes
+        '“': '"', '”': '"',   # curly double quotes
+        '…': '...', ' ': ' ', # ellipsis, non-breaking space
+        '•': '-', '‣': '-',   # bullet points
+        '●': '-', '►': '>',
+        '━': '-', '│': '|',   # box-drawing chars
+        '−': '-', '·': '-',   # minus sign, middle dot
+        '×': 'x', '÷': '/',  # × ÷
+        '―': '-',                  # horizontal bar
+        '▪': '-', '■': '-',
+    }
+    for ch, rep in replacements.items():
+        text = text.replace(ch, rep)
+    # Final safety: encode to CP1252, replace any remaining unrepresentable chars
+    return text.encode('cp1252', errors='replace').decode('cp1252')
+
+
 def generate_parecer_pdf_bytes(parecer_text, empresa, cnpj, modelo):
     """Generate PDF directly via fpdf2 (no Google Docs dependency)."""
     try:
@@ -1108,6 +1132,10 @@ def generate_parecer_pdf_bytes(parecer_text, empresa, cnpj, modelo):
         return None
     try:
         titulo = 'PARECER JURIDICO - TRIBUTARIO E FISCAL' if modelo == 'GERAL' else 'NOTA TECNICA TRIBUTARIA'
+        empresa_s = _sanitize_pdf_text(empresa)
+        cnpj_s = _sanitize_pdf_text(cnpj)
+        texto_s = _sanitize_pdf_text(parecer_text)
+
         pdf = FPDF(orientation='P', unit='mm', format='A4')
         pdf.set_auto_page_break(auto=True, margin=20)
         pdf.set_margins(left=25, top=25, right=20)
@@ -1116,13 +1144,13 @@ def generate_parecer_pdf_bytes(parecer_text, empresa, cnpj, modelo):
         # Title block
         pdf.set_font('Helvetica', 'B', 13)
         pdf.multi_cell(0, 7, titulo, align='C')
-        subtitulo = empresa + (f'  |  CNPJ: {cnpj}' if cnpj else '') + '  |  Compliance-CE'
+        subtitulo = empresa_s + (f'  |  CNPJ: {cnpj_s}' if cnpj_s else '') + '  |  Compliance-CE'
         pdf.set_font('Helvetica', '', 10)
         pdf.multi_cell(0, 6, subtitulo, align='C')
         pdf.ln(5)
 
         # Body
-        for line in parecer_text.split('\n'):
+        for line in texto_s.split('\n'):
             stripped = line.strip()
             if not stripped:
                 pdf.ln(3)
@@ -1782,11 +1810,16 @@ async def _gerar_e_salvar(context, fid, flow):
         pdf_bytes = generate_parecer_pdf_bytes(parecer_text, empresa, cnpj, modelo)
 
         # Upload ambos direto ao Drive
-        docx_url, pdf_url = None, None
+        docx_url, pdf_url, drive_err = None, None, None
         if docx_bytes_raw or pdf_bytes:
-            docx_url, pdf_url = upload_files_to_drive(
+            docx_url, pdf_url, drive_err = upload_files_to_drive(
                 docx_bytes_raw, pdf_bytes, base_filename, flow['folder_id']
             )
+            if drive_err and not docx_url and not pdf_url:
+                await context.bot.send_message(
+                    chat_id=CHAT_ID,
+                    text=f'⚠️ Drive: falha ao salvar — {drive_err}'
+                )
 
         flow['docx_url'] = docx_url
         flow['pdf_url'] = pdf_url
