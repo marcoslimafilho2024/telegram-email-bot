@@ -997,66 +997,38 @@ def create_drive_folder(name, parent_id):
         return None, None
 
 
-def upload_docx_and_pdf(docx_bytes, base_filename, folder_id):
-    """Uploads .docx + converts to .pdf via Google Docs. Returns (docx_url, pdf_url, pdf_bytes).
-    If PDF export fails, returns (docx_url, None, None) so DOCX is at least accessible."""
+def upload_files_to_drive(docx_bytes, pdf_bytes, base_filename, folder_id):
+    """Upload DOCX and/or PDF directly to Drive. Returns (docx_url, pdf_url)."""
     svc = _drive_service()
     if not svc:
-        return None, None, None
-    from googleapiclient.http import MediaIoBaseUpload, MediaIoBaseDownload
+        return None, None
+    from googleapiclient.http import MediaIoBaseUpload
     DOCX_MIME = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
-
-    # Step 1: Upload DOCX (isolated — failure here aborts everything)
     docx_url = None
-    try:
-        docx_meta = {'name': base_filename + '.docx', 'parents': [folder_id]}
-        docx_file = svc.files().create(
-            body=docx_meta,
-            media_body=MediaIoBaseUpload(_io_module.BytesIO(docx_bytes), mimetype=DOCX_MIME),
-            fields='id,webViewLink'
-        ).execute()
-        docx_url = docx_file.get('webViewLink', '')
-    except Exception as e:
-        print(f'upload_docx error: {e}')
-        return None, None, None
-
-    # Step 2: PDF export via Google Docs (failure is non-fatal — DOCX already saved)
     pdf_url = None
-    pdf_bytes_out = None
-    try:
-        gdoc_meta = {'name': base_filename + '_tmp', 'parents': [folder_id],
-                     'mimeType': 'application/vnd.google-apps.document'}
-        gdoc = svc.files().create(
-            body=gdoc_meta,
-            media_body=MediaIoBaseUpload(_io_module.BytesIO(docx_bytes), mimetype=DOCX_MIME),
-            fields='id'
-        ).execute()
-        gdoc_id = gdoc['id']
-
-        req = svc.files().export_media(fileId=gdoc_id, mimeType='application/pdf')
-        pdf_buf = _io_module.BytesIO()
-        dl = MediaIoBaseDownload(pdf_buf, req)
-        done = False
-        while not done:
-            _, done = dl.next_chunk()
-        pdf_bytes_out = pdf_buf.getvalue()
-
+    if docx_bytes:
         try:
-            svc.files().delete(fileId=gdoc_id).execute()
-        except Exception:
-            pass
-
-        pdf_meta = {'name': base_filename + '.pdf', 'parents': [folder_id]}
-        pdf_file = svc.files().create(
-            body=pdf_meta,
-            media_body=MediaIoBaseUpload(_io_module.BytesIO(pdf_bytes_out), mimetype='application/pdf'),
-            fields='id,webViewLink'
-        ).execute()
-        pdf_url = pdf_file.get('webViewLink', '')
-    except Exception as e:
-        print(f'pdf_export error (DOCX already saved): {e}')
-
-    return docx_url, pdf_url, pdf_bytes_out
+            docx_meta = {'name': base_filename + '.docx', 'parents': [folder_id]}
+            docx_file = svc.files().create(
+                body=docx_meta,
+                media_body=MediaIoBaseUpload(_io_module.BytesIO(docx_bytes), mimetype=DOCX_MIME),
+                fields='id,webViewLink'
+            ).execute()
+            docx_url = docx_file.get('webViewLink', '')
+        except Exception as e:
+            print(f'upload_docx error: {e}')
+    if pdf_bytes:
+        try:
+            pdf_meta = {'name': base_filename + '.pdf', 'parents': [folder_id]}
+            pdf_file = svc.files().create(
+                body=pdf_meta,
+                media_body=MediaIoBaseUpload(_io_module.BytesIO(pdf_bytes), mimetype='application/pdf'),
+                fields='id,webViewLink'
+            ).execute()
+            pdf_url = pdf_file.get('webViewLink', '')
+        except Exception as e:
+            print(f'upload_pdf error: {e}')
+    return docx_url, pdf_url
 
 
 def generate_parecer_docx(parecer_text, empresa, cnpj, modelo):
@@ -1075,24 +1047,51 @@ def generate_parecer_docx(parecer_text, empresa, cnpj, modelo):
         sec.left_margin = Inches(1.2)
         sec.right_margin = Inches(1.2)
 
+    titulo_doc = 'NOTA TÉCNICA TRIBUTÁRIA' if modelo == 'EMPRESARIAL' else 'PARECER JURÍDICO - TRIBUTÁRIO E FISCAL'
     t = doc.add_paragraph()
     t.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    r = t.add_run(f'PARECER TÉCNICO {"EMPRESARIAL" if modelo == "EMPRESARIAL" else "GERAL"}')
+    r = t.add_run(titulo_doc)
     r.bold = True
-    r.font.size = Pt(14)
+    r.font.size = Pt(13)
+    t.paragraph_format.space_after = Pt(4)
 
     c = doc.add_paragraph()
     c.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    c.add_run(empresa + (f'  |  CNPJ: {cnpj}' if cnpj else ''))
+    c.add_run(empresa + (f'  |  CNPJ: {cnpj}' if cnpj else '') + '  |  Compliance-CE')
+    c.paragraph_format.space_after = Pt(8)
 
     doc.add_paragraph()
 
+    def _is_secao(line):
+        return bool(re.match(
+            r'^(CABECALHO|EMENTA|ASSINATURA|I\.|II\.|III\.|IV\.|II\.\d|III\.\d|IV\.\d)',
+            line.strip()
+        ))
+
     for line in parecer_text.split('\n'):
-        p = doc.add_paragraph(line if line.strip() else '')
-        if re.match(r'^\d{1,2}\.\s', line.strip()):
-            for run in p.runs:
-                run.bold = True
-                run.font.size = Pt(12)
+        line_str = line.strip()
+        p = doc.add_paragraph()
+        pf = p.paragraph_format
+        pf.line_spacing = Pt(18)
+        pf.space_before = Pt(0)
+        pf.space_after = Pt(4)
+
+        if not line_str:
+            pf.space_after = Pt(2)
+            continue
+
+        if _is_secao(line_str):
+            p.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
+            pf.first_line_indent = Inches(0)
+            pf.space_before = Pt(14)
+            r = p.add_run(line_str)
+            r.bold = True
+            r.font.size = Pt(11)
+        else:
+            p.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
+            pf.first_line_indent = Inches(0.79)  # 2 cm ≈ 0.79 inch
+            r = p.add_run(line_str)
+            r.font.size = Pt(11)
 
     buf = _io_module.BytesIO()
     doc.save(buf)
@@ -1100,50 +1099,165 @@ def generate_parecer_docx(parecer_text, empresa, cnpj, modelo):
     return buf
 
 
+def generate_parecer_pdf_bytes(parecer_text, empresa, cnpj, modelo):
+    """Generate PDF directly via fpdf2 (no Google Docs dependency)."""
+    try:
+        from fpdf import FPDF
+    except ImportError:
+        print('fpdf2 not installed')
+        return None
+    try:
+        titulo = 'PARECER JURIDICO - TRIBUTARIO E FISCAL' if modelo == 'GERAL' else 'NOTA TECNICA TRIBUTARIA'
+        pdf = FPDF(orientation='P', unit='mm', format='A4')
+        pdf.set_auto_page_break(auto=True, margin=20)
+        pdf.set_margins(left=25, top=25, right=20)
+        pdf.add_page()
+
+        # Title block
+        pdf.set_font('Helvetica', 'B', 13)
+        pdf.multi_cell(0, 7, titulo, align='C')
+        subtitulo = empresa + (f'  |  CNPJ: {cnpj}' if cnpj else '') + '  |  Compliance-CE'
+        pdf.set_font('Helvetica', '', 10)
+        pdf.multi_cell(0, 6, subtitulo, align='C')
+        pdf.ln(5)
+
+        # Body
+        for line in parecer_text.split('\n'):
+            stripped = line.strip()
+            if not stripped:
+                pdf.ln(3)
+                continue
+            is_sec = bool(re.match(
+                r'^(CABECALHO|EMENTA|ASSINATURA|I\.|II\.|III\.|IV\.|II\.\d|III\.\d|IV\.\d)',
+                stripped
+            ))
+            if is_sec:
+                pdf.ln(3)
+                pdf.set_font('Helvetica', 'B', 11)
+                pdf.multi_cell(0, 6, stripped, align='J')
+                pdf.set_font('Helvetica', '', 11)
+            else:
+                pdf.set_font('Helvetica', '', 11)
+                pdf.multi_cell(0, 6, stripped, align='J')
+                pdf.ln(1)
+
+        return bytes(pdf.output())
+    except Exception as e:
+        print(f'generate_parecer_pdf_bytes error: {e}')
+        return None
+
+
 def generate_parecer_claude_v2(email_data, modelo):
-    """Generates parecer with GERAL or EMPRESARIAL focus."""
+    """Generates parecer following MCP Compliance 9-section structure."""
     if not claude_client:
         return None
     empresa = email_data.get('empresa', 'Cliente')
     cnpj = email_data.get('cnpj', '')
     hoje = datetime.now().strftime('%d/%m/%Y')
+    meses = ['janeiro','fevereiro','março','abril','maio','junho',
+             'julho','agosto','setembro','outubro','novembro','dezembro']
+    hoje_obj = datetime.now()
+    hoje_extenso = f'{hoje_obj.day} de {meses[hoje_obj.month-1]} de {hoje_obj.year}'
+    cnpj_str = f' | CNPJ: {cnpj}' if cnpj else ''
 
-    instrucao = (
-        'MODELO EMPRESARIAL — foco em estrutura societária, planejamento tributário preventivo, '
-        'impactos por setor/CNAE, riscos de contingência e recomendações estratégicas.'
-        if modelo == 'EMPRESARIAL' else
-        'MODELO GERAL — foco em análise técnica da legislação, interpretação normativa, '
-        'orientações operacionais para conformidade e jurisprudência aplicável.'
-    )
+    if modelo == 'GERAL':
+        titulo = 'PARECER JURIDICO - TRIBUTARIO E FISCAL'
+        profundidade = (
+            'Parecer tecnico completo. Maximo 5 paginas. '
+            'Citar artigo, paragrafo, inciso, alinea em CADA afirmacao legal. '
+            'Ex: "nos termos do art. 12, par. 2, inciso I, alinea b, da LC 214/2025". '
+            'Todas as 9 secoes em extensao integral.'
+        )
+        base_legal_regra = 'Citar dispositivos legais completos no corpo de cada subsecao.'
+    else:
+        titulo = 'NOTA TECNICA TRIBUTARIA'
+        profundidade = (
+            'Nota tecnica condensada. Maximo 3 paginas. '
+            'Linguagem direta para o empresario: "imposto" em vez de "tributo", '
+            '"nota fiscal" em vez de "NF-e", "boleto" em vez de "DAE". '
+            'Todas as 9 secoes obrigatorias, mas condensadas ao essencial.'
+        )
+        base_legal_regra = 'Base legal APENAS na tabela da secao II.7. NAO citar artigos no corpo do texto.'
 
-    prompt = f"""Você é Marcos Lima, contador tributário da Compliance-CE.
-{instrucao}
+    prompt = f"""Voce e Marcos Lima, contador tributario da Compliance-CE (Fortaleza/CE).
+Elabore um {titulo} seguindo EXATAMENTE a estrutura abaixo.
 
-Elabore um PARECER TÉCNICO completo nas 10 seções:
+MODO: {modelo} — {profundidade}
 
-1. CABEÇALHO — Data: {hoje} | Empresa: {empresa} | CNPJ: {cnpj} | Parecerista: Marcos Lima — CRC/CE
-2. QUESTIONAMENTO — Contextualize a consulta com base no email.
-3. BASE LEGAL ATUALIZADA — Artigos/incisos/alíneas. Ex: "LC 214/2025, art. X, § Y"
-4. INTERPRETAÇÃO NORMATIVA — Análise técnica, hermenêutica, doutrina.
-5. IMPLICAÇÕES PRÁTICAS — Consequências fiscal, operacional e contábil.
-6. ORIENTAÇÕES OPERACIONAIS — O que fazer: prazos, procedimentos.
-7. VEDAÇÕES OU EXCEÇÕES — Restrições, exceções, riscos de autuação.
-8. CITAÇÕES COMPLEMENTARES — Jurisprudência, Soluções de Consulta, SEFAZ.
-9. CONCLUSÃO — Resposta direta e objetiva a cada pergunta.
-10. ASSINATURA TÉCNICA — Marcos Lima — CRC/CE | {hoje}
-    ⚠️ PARECER PRELIMINAR — sujeito a revisão antes da entrega.
+=== ESTRUTURA OBRIGATORIO (copiar os cabecalhos exatamente) ===
 
-Email recebido:
+CABECALHO
+CONSULENTE: {empresa}{cnpj_str}
+DATA: {hoje}
+ASSUNTO: {email_data['subject']}
+LEGISLACAO: [listar as principais normas aplicadas, ex: LC 214/2025, CTN, RIR/2018]
+
+EMENTA: [TODO EM MAIUSCULAS. 4 a 6 linhas. Tema + enquadramento legal + tese juridica + conclusao. Elaborar somente apos concluir a analise.]
+
+I. RELATORIO
+[Contextualizar a consulta: quem pergunta, o que pergunta, fatos relevantes. PROIBIDO antecipar conclusoes ou citar artigos nesta secao.]
+
+II. FUNDAMENTACAO
+
+II.1 Contexto do Questionamento
+[Apresentar o contexto tecnico e relevancia da materia.]
+
+II.2 Base Legal Atualizada
+[{base_legal_regra} Incluir vigencia e eventuais alteracoes recentes.]
+
+II.3 Interpretacao Normativa
+[Analise tecnica: hermeneutica, ratio legis, posicao administrativa (RFB, SEFAZ-CE).]
+
+II.4 Implicacoes Praticas
+[Consequencias: fiscal, operacional, contabil. O que muda na rotina do cliente.]
+
+II.5 Orientacoes Operacionais
+[O que o cliente deve fazer: prazos, procedimentos, documentos necessarios.]
+
+II.6 Vedacoes e Excecoes
+[O que NAO pode ser feito. Riscos de autuacao. Situacoes de excecao.]
+
+II.7 Citacoes Complementares
+[Jurisprudencia do CARF, Solucoes de Consulta RFB, orientacoes SEFAZ. Citar numero/data.]
+
+III. EXEMPLOS PRATICOS
+[INCLUIR SOMENTE SE o tema envolver calculos tributarios, regimes comparativos, split payment, Simples Nacional. OMITIR se o tema for puramente interpretativo.]
+
+IV. CONCLUSAO
+1. [Resposta direta ao questionamento 1]
+2. [Resposta direta ao questionamento 2, se houver]
+[Numerada. Clara e executavel sem leitura previa da Fundamentacao.]
+
+ASSINATURA
+E o parecer, salvo melhor juizo.
+Fortaleza, {hoje_extenso}.
+Marcos Lima — Contador e Cientista de Dados | CRC/CE n. 23.224
+
+=== REGRAS INVIOLAVEIS ===
+
+1. TRAVESSAO (—) PROIBIDO EM QUALQUER PARTE DO TEXTO. Substitua por virgula ou dois-pontos.
+2. PALAVRAS PROIBIDAS: "cumpre salientar", "destarte", "outrossim", "no que tange", "consoante",
+   "em que pese", "assim sendo", "nesse diapasao", "verifica-se que", "nota-se que",
+   "observa-se que", "ressalte-se que", "importa destacar", "urge destacar", "mister se faz",
+   "afigura-se", "ab initio", "ex vi", "precipuamente", "sobremodo", "nesse passo".
+   Substitua por: "portanto", "alem disso", "conforme", "quanto a", "apesar de", "assim".
+3. Um paragrafo = uma ideia. Maximo 4 paragrafos por subsecao.
+4. Frases curtas. Maximo 2 oracoes subordinadas por frase.
+5. Secoes numeradas com algarismo romano (I, II, III). Subsecoes: II.1, II.2, etc.
+6. Linguagem tecnica formal e direta. Sem adjetivos desnecessarios.
+
+=== EMAIL RECEBIDO ===
+
 De: {email_data['sender']}
 Assunto: {email_data['subject']}
 
-{email_data['body']}
+{email_data['body'][:3000]}
 
-Responda em português, linguagem técnica tributária. Cite legislação completa e precisa."""
+Responda SOMENTE com o texto do parecer no formato indicado. Sem preambulo, sem meta-comentarios."""
 
     msg = claude_client.messages.create(
         model='claude-sonnet-4-6',
-        max_tokens=4500,
+        max_tokens=6000,
         messages=[{'role': 'user', 'content': prompt}]
     )
     return msg.content[0].text
@@ -1662,11 +1776,17 @@ async def _gerar_e_salvar(context, fid, flow):
         flow['base_filename'] = base_filename
 
         docx_buf = generate_parecer_docx(parecer_text, empresa, cnpj, modelo)
-        docx_bytes_raw = None
-        docx_url, pdf_url, pdf_bytes = None, None, None
-        if docx_buf:
-            docx_bytes_raw = docx_buf.read()
-            docx_url, pdf_url, pdf_bytes = upload_docx_and_pdf(docx_bytes_raw, base_filename, flow['folder_id'])
+        docx_bytes_raw = docx_buf.read() if docx_buf else None
+
+        # Gera PDF localmente (sem Google Docs)
+        pdf_bytes = generate_parecer_pdf_bytes(parecer_text, empresa, cnpj, modelo)
+
+        # Upload ambos direto ao Drive
+        docx_url, pdf_url = None, None
+        if docx_bytes_raw or pdf_bytes:
+            docx_url, pdf_url = upload_files_to_drive(
+                docx_bytes_raw, pdf_bytes, base_filename, flow['folder_id']
+            )
 
         flow['docx_url'] = docx_url
         flow['pdf_url'] = pdf_url
