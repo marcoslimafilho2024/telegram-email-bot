@@ -997,41 +997,49 @@ def create_drive_folder(name, parent_id):
         return None, None
 
 
-def upload_files_to_drive(docx_bytes, pdf_bytes, base_filename, folder_id):
-    """Upload DOCX and/or PDF directly to Drive. Returns (docx_url, pdf_url, error_msg)."""
+def upload_to_drive_as_gdoc(docx_bytes, base_filename, folder_id):
+    """Upload DOCX as Google Doc format (no service-account storage quota consumed).
+    Returns (gdoc_url, pdf_bytes, err_msg).
+    Google-native files don't count against service account quota — only binary files do."""
     svc = _drive_service()
     if not svc:
         return None, None, 'GOOGLE_SERVICE_ACCOUNT_JSON nao configurado'
-    from googleapiclient.http import MediaIoBaseUpload
+    from googleapiclient.http import MediaIoBaseUpload, MediaIoBaseDownload
     DOCX_MIME = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
-    docx_url = None
-    pdf_url = None
-    last_err = None
-    if docx_bytes:
-        try:
-            docx_meta = {'name': base_filename + '.docx', 'parents': [folder_id]}
-            docx_file = svc.files().create(
-                body=docx_meta,
-                media_body=MediaIoBaseUpload(_io_module.BytesIO(docx_bytes), mimetype=DOCX_MIME),
-                fields='id,webViewLink'
-            ).execute()
-            docx_url = docx_file.get('webViewLink', '')
-        except Exception as e:
-            last_err = f'upload_docx: {e}'
-            print(last_err)
-    if pdf_bytes:
-        try:
-            pdf_meta = {'name': base_filename + '.pdf', 'parents': [folder_id]}
-            pdf_file = svc.files().create(
-                body=pdf_meta,
-                media_body=MediaIoBaseUpload(_io_module.BytesIO(pdf_bytes), mimetype='application/pdf'),
-                fields='id,webViewLink'
-            ).execute()
-            pdf_url = pdf_file.get('webViewLink', '')
-        except Exception as e:
-            last_err = f'upload_pdf: {e}'
-            print(last_err)
-    return docx_url, pdf_url, last_err
+    gdoc_url = None
+    pdf_bytes = None
+    err = None
+    # Step 1: Upload DOCX converting to Google Docs format (free of binary quota)
+    try:
+        gdoc_meta = {
+            'name': base_filename,
+            'parents': [folder_id],
+            'mimeType': 'application/vnd.google-apps.document',
+        }
+        gdoc = svc.files().create(
+            body=gdoc_meta,
+            media_body=MediaIoBaseUpload(_io_module.BytesIO(docx_bytes), mimetype=DOCX_MIME),
+            fields='id,webViewLink'
+        ).execute()
+        gdoc_url = gdoc.get('webViewLink', '')
+        gdoc_id = gdoc['id']
+    except Exception as e:
+        err = f'gdoc_upload: {e}'
+        print(err)
+        return None, None, err
+    # Step 2: Export Google Doc as PDF bytes (read operation, no quota)
+    try:
+        req = svc.files().export_media(fileId=gdoc_id, mimeType='application/pdf')
+        pdf_buf = _io_module.BytesIO()
+        dl = MediaIoBaseDownload(pdf_buf, req)
+        done = False
+        while not done:
+            _, done = dl.next_chunk()
+        pdf_bytes = pdf_buf.getvalue()
+    except Exception as e:
+        err = f'pdf_export: {e}'
+        print(err)
+    return gdoc_url, pdf_bytes, err
 
 
 def generate_parecer_docx(parecer_text, empresa, cnpj, modelo):
@@ -1766,18 +1774,14 @@ async def handle_callback_query(update, context):
         await _enviar_email_resposta(query, context, fid, flow)
 
     elif action == 'ac':
-        pdf_url = flow.get('pdf_url', '')
-        docx_url = flow.get('docx_url', '')
+        gdoc_url = flow.get('docx_url', '')  # docx_url armazena o link do Google Doc
         _parecer_flow.pop(fid, None)
-        if pdf_url or docx_url:
-            lines = ['💾 Parecer salvo no Drive. Email não enviado.\n',
-                     'Para enviar depois, responda "envia o parecer" ou "manda o pdf".\n']
-            if pdf_url:
-                lines.append(f'📑 PDF: {pdf_url}')
-            if docx_url:
-                lines.append(f'📄 DOCX: {docx_url}')
+        if gdoc_url:
+            lines = ['📄 Parecer salvo no Drive como Google Doc. Email não enviado.\n',
+                     'Para enviar depois, responda "envia o parecer" ou "manda o pdf".\n',
+                     f'📄 Google Doc: {gdoc_url}']
         else:
-            lines = ['⚠️ Parecer gerado mas não foi possível salvar no Drive.\n',
+            lines = ['⚠️ Parecer não salvo no Drive (falha).\n',
                      'O arquivo foi enviado no Telegram acima.\n',
                      'Para reenviar depois, responda "manda o pdf".']
         await query.edit_message_text('\n'.join(lines))
@@ -1806,23 +1810,28 @@ async def _gerar_e_salvar(context, fid, flow):
         docx_buf = generate_parecer_docx(parecer_text, empresa, cnpj, modelo)
         docx_bytes_raw = docx_buf.read() if docx_buf else None
 
-        # Gera PDF localmente (sem Google Docs)
-        pdf_bytes = generate_parecer_pdf_bytes(parecer_text, empresa, cnpj, modelo)
-
-        # Upload ambos direto ao Drive
-        docx_url, pdf_url, drive_err = None, None, None
-        if docx_bytes_raw or pdf_bytes:
-            docx_url, pdf_url, drive_err = upload_files_to_drive(
-                docx_bytes_raw, pdf_bytes, base_filename, flow['folder_id']
+        # Upload ao Drive como Google Doc (sem cota de storage para service accounts)
+        gdoc_url = None
+        pdf_bytes = None
+        if docx_bytes_raw:
+            gdoc_url, pdf_bytes, drive_err = upload_to_drive_as_gdoc(
+                docx_bytes_raw, base_filename, flow['folder_id']
             )
-            if drive_err and not docx_url and not pdf_url:
+            if drive_err and not gdoc_url:
                 await context.bot.send_message(
                     chat_id=CHAT_ID,
-                    text=f'⚠️ Drive: falha ao salvar — {drive_err}'
+                    text=f'⚠️ Drive: {drive_err}'
                 )
 
-        flow['docx_url'] = docx_url
-        flow['pdf_url'] = pdf_url
+        # Fallback: gera PDF localmente via fpdf2 se Drive falhou
+        if not pdf_bytes:
+            try:
+                pdf_bytes = generate_parecer_pdf_bytes(parecer_text, empresa, cnpj, modelo)
+            except Exception as e:
+                await context.bot.send_message(chat_id=CHAT_ID, text=f'⚠️ fpdf2: {e}')
+
+        flow['docx_url'] = gdoc_url   # Link do Google Doc no Drive
+        flow['pdf_url'] = None        # PDF exportado em memória, não salvo separado
         flow['pdf_bytes'] = pdf_bytes
         flow['state'] = 'await_auth'
 
@@ -1856,10 +1865,8 @@ async def _gerar_e_salvar(context, fid, flow):
             f'🏢 {empresa}' + (f'  |  CNPJ: {cnpj}' if cnpj else ''),
             f'📁 Pasta: {flow["folder_name"]}\n',
         ]
-        if docx_url:
-            lines.append(f'📄 DOCX: {docx_url}')
-        if pdf_url:
-            lines.append(f'📑 PDF: {pdf_url}')
+        if gdoc_url:
+            lines.append(f'📄 Google Doc (Drive): {gdoc_url}')
         lines.append('\nRevise o PDF acima e decida:')
 
         buttons = [
