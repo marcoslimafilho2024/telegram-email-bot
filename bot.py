@@ -1810,28 +1810,32 @@ async def _gerar_e_salvar(context, fid, flow):
         docx_buf = generate_parecer_docx(parecer_text, empresa, cnpj, modelo)
         docx_bytes_raw = docx_buf.read() if docx_buf else None
 
-        # Upload ao Drive como Google Doc (sem cota de storage para service accounts)
+        # Gera PDF localmente via fpdf2 (garantido, sem dependência externa)
+        pdf_bytes = generate_parecer_pdf_bytes(parecer_text, empresa, cnpj, modelo)
+
+        # Tenta upload ao Drive como Google Doc (bônus — falha não bloqueia)
         gdoc_url = None
-        pdf_bytes = None
         if docx_bytes_raw:
-            gdoc_url, pdf_bytes, drive_err = upload_to_drive_as_gdoc(
-                docx_bytes_raw, base_filename, flow['folder_id']
-            )
-            if drive_err and not gdoc_url:
+            try:
+                gdoc_url, pdf_from_drive, drive_err = upload_to_drive_as_gdoc(
+                    docx_bytes_raw, base_filename, flow['folder_id']
+                )
+                if drive_err and not gdoc_url:
+                    await context.bot.send_message(
+                        chat_id=CHAT_ID,
+                        text=f'⚠️ Drive indisponível: {drive_err[:200]}'
+                    )
+                # Se Drive exportou PDF com melhor qualidade, usa ele
+                if pdf_from_drive:
+                    pdf_bytes = pdf_from_drive
+            except Exception as drive_exc:
                 await context.bot.send_message(
                     chat_id=CHAT_ID,
-                    text=f'⚠️ Drive: {drive_err}'
+                    text=f'⚠️ Drive erro inesperado: {str(drive_exc)[:200]}'
                 )
 
-        # Fallback: gera PDF localmente via fpdf2 se Drive falhou
-        if not pdf_bytes:
-            try:
-                pdf_bytes = generate_parecer_pdf_bytes(parecer_text, empresa, cnpj, modelo)
-            except Exception as e:
-                await context.bot.send_message(chat_id=CHAT_ID, text=f'⚠️ fpdf2: {e}')
-
-        flow['docx_url'] = gdoc_url   # Link do Google Doc no Drive
-        flow['pdf_url'] = None        # PDF exportado em memória, não salvo separado
+        flow['docx_url'] = gdoc_url   # Link do Google Doc no Drive (None se falhou)
+        flow['pdf_url'] = None        # PDF em memória, não salvo separado no Drive
         flow['pdf_bytes'] = pdf_bytes
         flow['state'] = 'await_auth'
 
@@ -1840,8 +1844,8 @@ async def _gerar_e_salvar(context, fid, flow):
             'base_filename': base_filename,
             'pdf_bytes': pdf_bytes,
             'docx_bytes': docx_bytes_raw,
-            'pdf_url': pdf_url,
-            'docx_url': docx_url,
+            'pdf_url': None,
+            'docx_url': gdoc_url,
             'empresa': empresa,
             'email_data': email_data,
         })
