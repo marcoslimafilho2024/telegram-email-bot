@@ -210,8 +210,20 @@ CLAUDE_TOOLS = [
     },
     {
         "name": "marcar_lidos",
-        "description": "Marca todos os emails não lidos como lidos. Use para 'zera a caixa', 'marcar tudo como lido'.",
-        "input_schema": {"type": "object", "properties": {}}
+        "description": "Marca emails como lidos. Pode marcar TODOS ou apenas categorias específicas. Use 'zera a caixa' para tudo, ou 'marca PROPAGANDAS como lido', 'marca VENDAS e PROPAGANDAS como lidas' para categorias.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "categorias": {
+                    "type": "array",
+                    "items": {
+                        "type": "string",
+                        "enum": ["URGENTE", "VENDAS", "PROFISSIONAL", "PESSOAL", "FINANCEIRO", "OUTROS", "PROPAGANDAS"]
+                    },
+                    "description": "Categorias para marcar como lidas. Se omitido, marca TODOS os emails."
+                }
+            }
+        }
     },
     {
         "name": "navegar_emails",
@@ -999,6 +1011,38 @@ def mark_as_read(hours=None):
                     mail.store(b','.join(batch), '+FLAGS', '\\Seen')
             total += len(ids)
             mail.logout()
+        return total
+    except Exception as e:
+        return -1
+
+
+def mark_as_read_by_categories(categories, hours=None):
+    """Marca como lido apenas emails das categorias especificadas.
+    'PROPAGANDAS' mapeia para is_spam(); demais categorias para classify().
+    """
+    try:
+        cat_set = set(c.upper() for c in categories)
+        include_spam = 'PROPAGANDAS' in cat_set
+        cat_set.discard('PROPAGANDAS')
+        total = 0
+        for acc in ACCOUNTS:
+            mail_ro = get_imap(acc['user'], acc['password'], readonly=True)
+            ids = search_unseen(mail_ro, hours)
+            to_mark = []
+            for eid, sender, subject in fetch_headers(mail_ro, ids, limit=500):
+                if is_spam(sender, subject):
+                    if include_spam:
+                        to_mark.append(eid)
+                elif cat_set and classify(sender, subject) in cat_set:
+                    to_mark.append(eid)
+            mail_ro.logout()
+            if not to_mark:
+                continue
+            mail_rw = get_imap(acc['user'], acc['password'], readonly=False)
+            for i in range(0, len(to_mark), 100):
+                mail_rw.store(b','.join(to_mark[i:i+100]), '+FLAGS', '\\Seen')
+            total += len(to_mark)
+            mail_rw.logout()
         return total
     except Exception as e:
         return -1
@@ -2227,6 +2271,25 @@ async def _execute_tool(tool_name, tool_input, update, context):
     global _last_shown_email
     periodo_map = {'hoje': 24, 'semana': 168, 'tudo': None}
 
+    async def _send_long(text, max_len=4000):
+        """Envia texto longo dividido em múltiplas mensagens respeitando quebras de seção."""
+        if len(text) <= max_len:
+            await update.message.reply_text(text)
+            return
+        chunks, current = [], ''
+        for line in text.split('\n'):
+            if len(current) + len(line) + 1 > max_len:
+                if current.strip():
+                    chunks.append(current.strip())
+                current = line + '\n'
+            else:
+                current += line + '\n'
+        if current.strip():
+            chunks.append(current.strip())
+        for i, chunk in enumerate(chunks):
+            prefix = f'({i+1}/{len(chunks)}) ' if len(chunks) > 1 else ''
+            await update.message.reply_text(prefix + chunk)
+
     if tool_name == 'ver_emails':
         periodo = tool_input.get('periodo', 'hoje')
         cat = tool_input.get('categoria')
@@ -2236,7 +2299,7 @@ async def _execute_tool(tool_name, tool_input, update, context):
             await update.message.reply_text(f'❌ Erro: {err}')
         else:
             title = f'📬 {periodo.capitalize()} — {total} total, {spam} propagandas'
-            await update.message.reply_text(build_message(buckets, title))
+            await _send_long(build_message(buckets, title))
 
     elif tool_name == 'contar_emails':
         total, counts, spam, err = count_by_category(limit=500)
@@ -2313,7 +2376,14 @@ async def _execute_tool(tool_name, tool_input, update, context):
         await cmd_varredura(update, context)
 
     elif tool_name == 'marcar_lidos':
-        total = mark_as_read()
+        categorias = tool_input.get('categorias')
+        if categorias:
+            label = ', '.join(categorias)
+            await update.message.reply_text(f'⏳ Marcando {label} como lidos...')
+            total = mark_as_read_by_categories(categorias)
+        else:
+            await update.message.reply_text('⏳ Marcando TODOS como lidos...')
+            total = mark_as_read()
         await update.message.reply_text(
             f'✅ {total} email(s) marcados como lidos.' if total >= 0 else '❌ Erro ao marcar emails.'
         )
