@@ -207,6 +207,25 @@ CLAUDE_TOOLS = [
         "input_schema": {"type": "object", "properties": {}}
     },
     {
+        "name": "navegar_emails",
+        "description": "Abre a caixa de entrada com botões Próximo/Anterior para navegar email a email. Use para 'ver meus emails', 'navegar pela caixa', 'abrir emails', 'ver um por um'.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "periodo": {
+                    "type": "string",
+                    "enum": ["hoje", "semana", "tudo"],
+                    "description": "Período de busca (padrão: hoje)"
+                },
+                "categoria": {
+                    "type": "string",
+                    "enum": ["URGENTE", "VENDAS", "PROFISSIONAL", "PESSOAL", "FINANCEIRO", "OUTROS"],
+                    "description": "Filtrar por categoria (omitir para todas)"
+                }
+            }
+        }
+    },
+    {
         "name": "reenviar_pdf",
         "description": "Reenvia o PDF do último parecer gerado como documento no Telegram, e/ou envia por email. Use quando o usuário pedir 'quero ver o pdf', 'me manda o parecer', 'envia o parecer', 'mostra o pdf'.",
         "input_schema": {
@@ -273,6 +292,9 @@ _parecer_flow = {}        # fid -> state dict
 _flow_folders_cache = {}  # fid -> [(name, id), ...]
 _last_shown_email = None  # último email exibido na conversa (contexto)
 _last_parecer = None      # último parecer gerado (pdf_bytes, urls, filename)
+_email_cache = {}         # cache_key -> email_data (para botões de resposta)
+_reply_pending = {}       # chat_id -> email_data (aguardando digitar resposta)
+_nav_state = {}           # chat_id -> {'emails': [...], 'idx': int}
 
 # ─── REDIS — persistência de estado ──────────────────────────────────────────
 
@@ -348,6 +370,40 @@ def get_last_parecer():
 
 def persist_parecer_pending():
     _rset('parecer_pending', _parecer_pending)
+
+
+def cache_email(email_data):
+    """Armazena email no cache e retorna chave curta para uso em botões."""
+    import hashlib
+    key = hashlib.md5(
+        f"{email_data.get('sender','')}{email_data.get('subject','')}".encode()
+    ).hexdigest()[:8]
+    _email_cache[key] = email_data
+    return key
+
+
+def send_email_reply(email_data, reply_text):
+    """Envia reply de texto simples para o remetente original."""
+    try:
+        acc = ACCOUNTS[0]
+        for a in ACCOUNTS:
+            if email_data.get('account', '') == a['label']:
+                acc = a
+                break
+        original_sender = email_data.get('sender', '')
+        m = re.match(r'.*<([^>]+)>', original_sender)
+        reply_to = m.group(1) if m else original_sender
+        msg = MIMEMultipart()
+        msg['From'] = acc['user']
+        msg['To'] = reply_to
+        msg['Subject'] = f'Re: {email_data.get("subject", "")}'
+        msg.attach(MIMEText(reply_text, 'plain', 'utf-8'))
+        with smtplib.SMTP_SSL('smtp.gmail.com', 465) as smtp:
+            smtp.login(acc['user'], acc['password'])
+            smtp.sendmail(acc['user'], [reply_to], msg.as_bytes())
+        return True, None
+    except Exception as e:
+        return False, str(e)
 
 def load_state_from_redis():
     """Carrega estado persistido do Redis para a memória ao iniciar."""
@@ -1389,7 +1445,21 @@ async def check_alerts(context):
                         f'🕐 {hora}\n\n'
                         f'{detail}'
                     )
-                    await context.bot.send_message(chat_id=CHAT_ID, text=msg_tg)
+                    try:
+                        rule_full = email.message_from_bytes(full_raw)
+                        rule_body = get_email_body(rule_full)
+                        rule_date = decode_str(rule_full.get('Date', ''))
+                        email_d = {'sender': sender, 'subject': subject,
+                                   'body': rule_body, 'date': rule_date, 'account': acc['label']}
+                        ck = cache_email(email_d)
+                        from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+                        markup = InlineKeyboardMarkup([[
+                            InlineKeyboardButton('📧 Ver email', callback_data=f'ev:{ck}'),
+                            InlineKeyboardButton('↩️ Responder', callback_data=f'er:{ck}'),
+                        ]])
+                        await context.bot.send_message(chat_id=CHAT_ID, text=msg_tg, reply_markup=markup)
+                    except Exception:
+                        await context.bot.send_message(chat_id=CHAT_ID, text=msg_tg)
                     continue  # já tratado pela regra
 
                 # ── Verificar SOLICITAÇÕES DE PARECER ──
@@ -1448,7 +1518,22 @@ async def check_alerts(context):
                             f'📧 {subject}\n'
                             f'↳ {name}'
                         )
-                        await context.bot.send_message(chat_id=CHAT_ID, text=msg_tg)
+                        try:
+                            _, full_data = mail.fetch(eid, '(BODY.PEEK[])')
+                            full_msg = email.message_from_bytes(full_data[0][1])
+                            body = get_email_body(full_msg)
+                            date_str = decode_str(full_msg.get('Date', ''))
+                            email_d = {'sender': sender, 'subject': subject,
+                                       'body': body, 'date': date_str, 'account': acc['label']}
+                            ck = cache_email(email_d)
+                            from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+                            markup = InlineKeyboardMarkup([[
+                                InlineKeyboardButton('📧 Ver email', callback_data=f'ev:{ck}'),
+                                InlineKeyboardButton('↩️ Responder', callback_data=f'er:{ck}'),
+                            ]])
+                            await context.bot.send_message(chat_id=CHAT_ID, text=msg_tg, reply_markup=markup)
+                        except Exception:
+                            await context.bot.send_message(chat_id=CHAT_ID, text=msg_tg)
 
             mail.logout()
         except Exception as e:
@@ -1727,8 +1812,69 @@ async def handle_callback_query(update, context):
     if query.message.chat.id != CHAT_ID:
         return
 
-    parts = query.data.split(':', 2)
+    data = query.data
+    parts = data.split(':', 2)
     action = parts[0]
+    chat_id = query.message.chat.id
+
+    # ── Navegação pela caixa ───────────────────────────────────────────────────
+    if action in ('nn', 'np'):
+        state = _nav_state.get(chat_id)
+        if not state:
+            await query.answer('Sessão de navegação expirada.')
+            return
+        delta = 1 if action == 'nn' else -1
+        new_idx = max(0, min(state['idx'] + delta, len(state['emails']) - 1))
+        state['idx'] = new_idx
+        await _show_nav_email(chat_id, context.bot, edit_msg_id=query.message.message_id)
+        return
+
+    # ── Ver corpo completo do email ────────────────────────────────────────────
+    if action == 'ev':
+        ck = parts[1] if len(parts) > 1 else ''
+        email_data = _email_cache.get(ck)
+        if not email_data:
+            await query.edit_message_text('❌ Cache expirado. Busque o email novamente.')
+            return
+        name = email_data['sender'].split('<')[0].strip().strip('"') or email_data['sender']
+        text = (
+            f'📧 De: {name}\n'
+            f'📌 {email_data["subject"]}\n'
+            f'📅 {email_data.get("date","")}\n\n'
+            f'{email_data["body"][:3500]}'
+        )
+        markup = InlineKeyboardMarkup([[
+            InlineKeyboardButton('↩️ Responder', callback_data=f'er:{ck}'),
+        ]])
+        try:
+            await query.edit_message_text(text[:4096], reply_markup=markup)
+        except Exception:
+            await context.bot.send_message(chat_id=CHAT_ID, text=text[:4096], reply_markup=markup)
+        return
+
+    # ── Responder email ────────────────────────────────────────────────────────
+    if action == 'er':
+        ck = parts[1] if len(parts) > 1 else ''
+        email_data = _email_cache.get(ck)
+        if not email_data:
+            await query.edit_message_text('❌ Cache expirado. Busque o email novamente.')
+            return
+        _reply_pending[chat_id] = email_data
+        name = email_data['sender'].split('<')[0].strip().strip('"') or email_data['sender']
+        try:
+            await query.edit_message_text(
+                f'↩️ Respondendo para: {name}\n'
+                f'📌 Re: {email_data["subject"]}\n\n'
+                f'Digite sua resposta (ou "cancelar" para desistir):'
+            )
+        except Exception:
+            await context.bot.send_message(
+                chat_id=CHAT_ID,
+                text=f'↩️ Respondendo para: {name}\n📌 Re: {email_data["subject"]}\n\nDigite sua resposta:'
+            )
+        return
+
+    # ── Fluxo de parecer (ações com fid numérico) ──────────────────────────────
     try:
         fid = int(parts[1])
     except (IndexError, ValueError):
@@ -2087,11 +2233,17 @@ async def _execute_tool(tool_name, tool_input, update, context):
             await update.message.reply_text(f'📭 Nenhum email encontrado de "{nome}".')
         else:
             persist_last_email(data)
+            ck = cache_email(data)
+            from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+            markup = InlineKeyboardMarkup([[
+                InlineKeyboardButton('↩️ Responder', callback_data=f'er:{ck}'),
+            ]])
             await update.message.reply_text(
                 f'📧 De: {data["sender"]}\n'
                 f'📌 Assunto: {data["subject"]}\n'
                 f'📅 Data: {data["date"]}\n\n'
-                f'{data["body"][:800]}'
+                f'{data["body"][:800]}',
+                reply_markup=markup
             )
 
     elif tool_name == 'analisar_email':
@@ -2102,9 +2254,14 @@ async def _execute_tool(tool_name, tool_input, update, context):
             await update.message.reply_text(f'📭 Nenhum email encontrado de "{nome}".')
         else:
             persist_last_email(data)
+            ck = cache_email(data)
             await update.message.reply_text('⏳ Analisando com IA...')
             analysis = analyze_with_claude(data)
-            await update.message.reply_text(analysis)
+            from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+            markup = InlineKeyboardMarkup([[
+                InlineKeyboardButton('↩️ Responder', callback_data=f'er:{ck}'),
+            ]])
+            await update.message.reply_text(analysis, reply_markup=markup)
 
     elif tool_name == 'gerar_parecer':
         await cmd_gerar_parecer(update, context)
@@ -2135,6 +2292,44 @@ async def _execute_tool(tool_name, tool_input, update, context):
         await update.message.reply_text(
             f'✅ {total} email(s) marcados como lidos.' if total >= 0 else '❌ Erro ao marcar emails.'
         )
+
+    elif tool_name == 'navegar_emails':
+        periodo = tool_input.get('periodo', 'hoje')
+        cat = tool_input.get('categoria')
+        hours = periodo_map.get(periodo, 24)
+        await update.message.reply_text(f'🔍 Carregando emails ({periodo})...')
+        emails = []
+        for acc in ACCOUNTS:
+            try:
+                mail = get_imap(acc['user'], acc['password'], readonly=True)
+                ids = search_unseen(mail, hours)
+                for eid, sender, subject in fetch_headers(mail, ids, limit=60):
+                    if is_spam(sender, subject):
+                        continue
+                    if cat and classify(sender, subject) != cat:
+                        continue
+                    _, msg_data = mail.fetch(eid, '(BODY.PEEK[])')
+                    msg = email.message_from_bytes(msg_data[0][1])
+                    body = get_email_body(msg)
+                    date_str = decode_str(msg.get('Date', ''))
+                    emails.append({
+                        'sender': sender, 'subject': subject,
+                        'body': body, 'date': date_str, 'account': acc['label']
+                    })
+                    if len(emails) >= 12:
+                        break
+                mail.logout()
+            except Exception as e:
+                await update.message.reply_text(f'❌ Erro: {e}')
+                return
+            if len(emails) >= 12:
+                break
+        if not emails:
+            await update.message.reply_text('📭 Nenhum email encontrado.')
+            return
+        chat_id = update.effective_chat.id
+        _nav_state[chat_id] = {'emails': emails, 'idx': 0}
+        await _show_nav_email(chat_id, context.bot)
 
     elif tool_name == 'reenviar_pdf':
         from telegram import InputFile
@@ -2188,6 +2383,25 @@ async def _execute_tool(tool_name, tool_input, update, context):
 
 @only_authorized
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+
+    # ── Modo de resposta a email ──────────────────────────────────────────────
+    if chat_id in _reply_pending:
+        text = update.message.text.strip()
+        if text.lower() == 'cancelar':
+            _reply_pending.pop(chat_id)
+            await update.message.reply_text('↩️ Resposta cancelada.')
+            return
+        email_data = _reply_pending.pop(chat_id)
+        await update.message.reply_text('⏳ Enviando resposta...')
+        ok, err = send_email_reply(email_data, text)
+        if ok:
+            name = email_data['sender'].split('<')[0].strip().strip('"') or email_data['sender']
+            await update.message.reply_text(f'✅ Resposta enviada para {name}!')
+        else:
+            await update.message.reply_text(f'❌ Erro ao enviar: {err}')
+        return
+
     # Intercepta digitação de nome de pasta durante fluxo de parecer
     for fid, flow in list(_parecer_flow.items()):
         if flow.get('state') == 'folder_new':
@@ -2263,6 +2477,56 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     except Exception as e:
         await update.message.reply_text(f'❌ Erro ao processar: {e}')
+
+
+# ─── NAVEGAÇÃO INTERATIVA ────────────────────────────────────────────────────
+
+async def _show_nav_email(chat_id, bot, edit_msg_id=None):
+    """Mostra o email atual da sessão de navegação com botões Anterior/Próximo/Responder."""
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+    state = _nav_state.get(chat_id)
+    if not state:
+        return
+    idx = state['idx']
+    emails = state['emails']
+    total = len(emails)
+    email_data = emails[idx]
+
+    ck = cache_email(email_data)
+    name = email_data['sender'].split('<')[0].strip().strip('"') or email_data['sender']
+    body_preview = email_data['body'][:700]
+    truncated = '...' if len(email_data['body']) > 700 else ''
+
+    text = (
+        f'[{idx + 1}/{total}] {email_data["account"]}\n\n'
+        f'📧 De: {name}\n'
+        f'📌 {email_data["subject"]}\n'
+        f'📅 {email_data.get("date", "")}\n\n'
+        f'{body_preview}{truncated}'
+    )
+
+    nav_row = []
+    if idx > 0:
+        nav_row.append(InlineKeyboardButton('◀ Anterior', callback_data='np'))
+    if idx < total - 1:
+        nav_row.append(InlineKeyboardButton('Próximo ▶', callback_data='nn'))
+
+    buttons = []
+    if nav_row:
+        buttons.append(nav_row)
+    buttons.append([InlineKeyboardButton('↩️ Responder', callback_data=f'er:{ck}')])
+    markup = InlineKeyboardMarkup(buttons)
+
+    if edit_msg_id:
+        try:
+            await bot.edit_message_text(
+                chat_id=chat_id, message_id=edit_msg_id,
+                text=text[:4096], reply_markup=markup
+            )
+            return
+        except Exception:
+            pass
+    await bot.send_message(chat_id=chat_id, text=text[:4096], reply_markup=markup)
 
 
 # ─── MAIN ────────────────────────────────────────────────────────────────────
