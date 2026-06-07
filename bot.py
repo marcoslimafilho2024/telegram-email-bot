@@ -43,6 +43,10 @@ GMAIL_APP_PASSWORD = ACCOUNTS[0]['password']
 # Palavras que disparam 🚨 ALERTA na hora, independente do horário
 
 ALERT_KEYWORDS = [
+    # AWS — alertas de custo e Free Tier (conta Compliance 315527911490)
+    'aws budget', 'aws billing', 'amazon web services billing',
+    'free tier', 'free tier usage alert', 'budget threshold',
+    'budget notification', 'exceeded your', 'billing alert',
     # Pessoas chave
     'fellipe guerra', 'vanessa', 'ipog',
     # Obrigações fiscais
@@ -94,6 +98,9 @@ URGENT_SENDERS = [
     'sigmavaf.com.br', 'accounts.google.com', 'adveronix.com',
     'regularize', 'receita.fazenda', 'flex-wind.com', 'tailscale',
     'sefaz', 'prefeitura', 'tce.', 'tribunal',
+    # AWS — alertas de billing e orçamento
+    'billing.amazonaws.com', 'no-reply@billing.amazonaws.com',
+    'aws-billing', 'amazon.com/aws', 'amazonwebservices',
 ]
 URGENT_SUBJECTS = [
     'gestta', 'vencer', 'certificado', 'regularize', 'seguranca',
@@ -256,6 +263,20 @@ DRIVE_PARECER_ROOT_ID = os.environ.get('DRIVE_PARECER_ROOT_ID', '1Jd3oC3gNQoYXPU
 # Quando email bate numa regra: alerta Telegram + encaminha automaticamente
 
 RULES = [
+    {
+        'name': 'AWS Billing — Alerta de Custo',
+        'match_from': ['billing.amazonaws.com', 'no-reply@billing.amazonaws.com', 'aws-billing'],
+        'match_subject': ['budget', 'billing', 'free tier', 'exceeded', 'threshold', 'usage alert'],
+        'match_logic': 'or',
+        'action': 'alert_only',
+        'alert_msg': (
+            '🚨 ALERTA AWS — Cobrança detectada!\n'
+            '⚠️ Verifique imediatamente o console AWS:\n'
+            'Billing → Cost Explorer\n'
+            'Conta: Compliance (315527911490)'
+        ),
+        'priority': 'URGENTE',
+    },
     {
         'name': 'IPOG — Solicitação de NF',
         'match_from': ['nf@ipog.edu.br', 'ipog.edu.br'],
@@ -1421,7 +1442,11 @@ async def check_alerts(context):
 
                     action = rule.get('action', 'forward')
 
-                    if action == 'trello_card':
+                    if action == 'alert_only':
+                        full_msg = email.message_from_bytes(full_raw)
+                        body = get_email_body(full_msg)
+                        detail = f'📋 Conteúdo:\n{body[:400]}' if body else ''
+                    elif action == 'trello_card':
                         full_msg = email.message_from_bytes(full_raw)
                         body = get_email_body(full_msg)
                         lid = rule.get('trello_list_id') or TRELLO_MESA1_LIST_ID
