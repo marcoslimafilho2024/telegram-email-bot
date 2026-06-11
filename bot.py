@@ -2783,8 +2783,6 @@ async def _show_nav_email(chat_id, bot, edit_msg_id=None):
 # ─── MAIN ────────────────────────────────────────────────────────────────────
 
 def main():
-    import time
-    time.sleep(20)  # aguarda instância anterior ser encerrada pelo Railway
     load_state_from_redis()
 
     app = Application.builder().token(TELEGRAM_TOKEN).build()
@@ -2824,8 +2822,23 @@ def main():
 
     app.add_error_handler(error_handler)
 
-    print('Bot rodando com monitoramento a cada 10 minutos...')
-    app.run_polling(drop_pending_updates=True, bootstrap_retries=-1)
+    # Modo webhook quando rodando no Railway (sem conflito de polling)
+    port = int(os.environ.get('PORT', 0))
+    webhook_domain = os.environ.get('RAILWAY_PUBLIC_DOMAIN', '')
+
+    if port and webhook_domain:
+        webhook_url = f'https://{webhook_domain}/{TELEGRAM_TOKEN}'
+        print(f'Bot rodando em modo WEBHOOK: {webhook_url}')
+        app.run_webhook(
+            listen='0.0.0.0',
+            port=port,
+            webhook_url=webhook_url,
+            url_path=f'/{TELEGRAM_TOKEN}',
+            drop_pending_updates=True,
+        )
+    else:
+        print('Bot rodando em modo POLLING (local)...')
+        app.run_polling(drop_pending_updates=True, bootstrap_retries=-1)
 
 
 if __name__ == '__main__':
