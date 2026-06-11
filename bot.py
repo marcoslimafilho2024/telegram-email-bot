@@ -2405,9 +2405,20 @@ async def _enviar_email_resposta(query, context, fid, flow):
 
 @only_authorized
 async def cmd_remetentes(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Lista os remetentes com mais emails não lidos, agrupados por quantidade."""
+    """Lista os remetentes com mais emails não lidos, opcionalmente filtrado por categoria."""
     text = update.message.text.lower()
-    # Detecta se pediu filtro de tempo
+
+    # Detecta categoria pedida
+    _cat_map = {
+        'urgente': 'URGENTE', 'urgentes': 'URGENTE',
+        'venda': 'VENDAS', 'vendas': 'VENDAS',
+        'profissional': 'PROFISSIONAL', 'profissionais': 'PROFISSIONAL',
+        'pessoal': 'PESSOAL',
+        'financeiro': 'FINANCEIRO', 'financeira': 'FINANCEIRO',
+    }
+    cat_filter = next((v for k, v in _cat_map.items() if k in text), None)
+
+    # Detecta período
     if 'hoje' in text or '24h' in text:
         hours, periodo = 24, 'hoje'
     elif 'semana' in text:
@@ -2415,17 +2426,25 @@ async def cmd_remetentes(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         hours, periodo = None, 'caixa toda'
 
-    await update.message.reply_text(f'🔍 Mapeando remetentes ({periodo})...')
+    label = f'{cat_filter.lower()} — {periodo}' if cat_filter else periodo
+    await update.message.reply_text(f'🔍 Mapeando remetentes ({label})...')
     result, spam_count, err = fetch_by_sender(hours=hours, limit=300)
     if err:
         await update.message.reply_text(f'❌ Erro: {err}')
         return
+
+    if cat_filter:
+        result = [(n, a, c, cat) for n, a, c, cat in result if cat == cat_filter]
+
     if not result:
-        await update.message.reply_text('📭 Nenhum email não lido.')
+        msg = f'📭 Nenhum remetente {cat_filter.lower()}.' if cat_filter else '📭 Nenhum email não lido.'
+        await update.message.reply_text(msg)
         return
 
+    icon_header = ICONS.get(cat_filter, '👥') if cat_filter else '👥'
     total_emails = sum(c for _, _, c, _ in result)
-    lines = [f'👥 REMETENTES — {len(result)} únicos, {total_emails} emails ({periodo})\n']
+    header = f'{icon_header} REMETENTES {cat_filter or ""} — {len(result)} únicos, {total_emails} emails ({periodo})\n'
+    lines = [header]
     for nome, addr, count, cat in result[:25]:
         icon = ICONS.get(cat, '📌')
         bar = '█' * min(count, 10) + ('…' if count > 10 else '')
@@ -2433,7 +2452,8 @@ async def cmd_remetentes(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if len(result) > 25:
         lines.append(f'\n... e mais {len(result) - 25} remetentes')
-    lines.append(f'\n🗑️ Spam/propaganda ignorado: {spam_count}')
+    if not cat_filter:
+        lines.append(f'\n🗑️ Spam/propaganda ignorado: {spam_count}')
 
     await update.message.reply_text('\n'.join(lines))
 
@@ -2861,6 +2881,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(text, reply_markup=markup, parse_mode='Markdown')
         except Exception as e:
             await update.message.reply_text(f'❌ Erro ao analisar: {e}')
+        return
+
+    # Detecção direta de remetentes (com ou sem filtro de categoria)
+    if re.search(r'\bremetentes?\b', text_lower):
+        await cmd_remetentes(update, context)
         return
 
     # Detecção direta de criação de card Trello (sem depender do LLM)
