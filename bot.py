@@ -2813,8 +2813,17 @@ def main():
     app.add_handler(CommandHandler('ajuda', cmd_help))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
+    async def error_handler(update, context):
+        from telegram.error import NetworkError, TimedOut
+        if isinstance(context.error, (NetworkError, TimedOut)):
+            print(f'Erro de rede ignorado: {context.error}')
+            return
+        print(f'Erro não tratado: {context.error}')
+
+    app.add_error_handler(error_handler)
+
     print('Bot rodando com monitoramento a cada 10 minutos...')
-    app.run_polling(drop_pending_updates=True)
+    app.run_polling(drop_pending_updates=True, bootstrap_retries=-1)
 
 
 if __name__ == '__main__':
