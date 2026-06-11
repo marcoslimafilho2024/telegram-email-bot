@@ -135,7 +135,9 @@ Regras:
 - Para executar ações, use as ferramentas disponíveis — não apenas descreva o que fazer
 - Quando o usuário pede algo ambíguo, prefira agir e explicar brevemente o que fez
 - Ao listar emails, seja conciso: assunto + remetente, sem repetir cabeçalhos
-- Para pareceres tributários, sempre use a ferramenta gerar_parecer para iniciar o fluxo interativo"""
+- Para pareceres tributários, sempre use a ferramenta gerar_parecer para iniciar o fluxo interativo
+- Para criar cards no Trello: sempre use criar_card_trello quando o usuário disser "cria um card", "adiciona no trello", "coloca na fila", "lembra de fazer", "cria uma tarefa", ou qualquer variação. O título é o que vem depois dos dois pontos ou da vírgula.
+- NUNCA responda com menus de ajuda ou listas de capacidades. Sempre execute a ação diretamente ou faça uma pergunta específica sobre o que está faltando."""
 
 CLAUDE_TOOLS = [
     {
