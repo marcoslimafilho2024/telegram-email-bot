@@ -1,4 +1,5 @@
 import os
+import base64
 import imaplib
 import email
 import json
@@ -348,8 +349,10 @@ _last_parecer = None      # último parecer gerado (pdf_bytes, urls, filename)
 _email_cache = {}         # cache_key -> email_data (para botões de resposta)
 _reply_pending = {}       # chat_id -> email_data (aguardando digitar resposta)
 _nav_state = {}           # chat_id -> {'emails': [...], 'idx': int}
-_trello_card_pending = {} # chat_id -> {'titulo': str, 'descricao': str, 'lists': [(id, name)]}
-_trello_board_cache = {}  # board_name_lower -> (board_id, board_name)
+_trello_card_pending = {}       # chat_id -> {'titulo': str, 'descricao': str, 'lists': [(id, name)]}
+_trello_board_cache = {}        # board_name_lower -> (board_id, board_name)
+_trello_suggestion_pending = {} # chat_id -> {'titulo': str, 'descricao': str}  (aguardando confirmação)
+_trello_edit_pending = {}       # chat_id -> dict  (aguardando novo título digitado)
 
 # ─── REDIS — persistência de estado ──────────────────────────────────────────
 
@@ -1694,6 +1697,108 @@ async def check_alerts(context):
             print(f'Erro check_alerts {acc["user"]}: {e}')
 
 
+# ─── MÍDIA → SUGESTÃO DE CARD TRELLO ─────────────────────────────────────────
+
+def _trello_suggestion_markup(titulo):
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+    return (
+        f'📌 *Card sugerido:*\n_{titulo}_\n\nConfirma?',
+        InlineKeyboardMarkup([
+            [InlineKeyboardButton('✅ Confirmar', callback_data='tsc'),
+             InlineKeyboardButton('✏️ Editar título', callback_data='tse')],
+            [InlineKeyboardButton('❌ Cancelar', callback_data='tsx')],
+        ])
+    )
+
+
+@only_authorized
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not claude_client:
+        await update.message.reply_text('❌ ANTHROPIC_API_KEY não configurada.')
+        return
+    await update.message.reply_text('🔍 Analisando imagem...')
+    photo = update.message.photo[-1]
+    file = await context.bot.get_file(photo.file_id)
+    img_bytes = bytes(await file.download_as_bytearray())
+    b64 = base64.b64encode(img_bytes).decode()
+    try:
+        msg = claude_client.messages.create(
+            model='claude-haiku-4-5-20251001',
+            max_tokens=200,
+            messages=[{'role': 'user', 'content': [
+                {'type': 'text', 'text': (
+                    'Você é o assistente de Marcos Lima, contador tributário da Compliance-CE. '
+                    'Analise esta imagem e sugira um título curto (máx 80 caracteres) para um card '
+                    'do Trello representando a tarefa ou demanda visível. '
+                    'Responda APENAS com o título, sem aspas, sem explicação.'
+                )},
+                {'type': 'image', 'source': {'type': 'base64', 'media_type': 'image/jpeg', 'data': b64}},
+            ]}]
+        )
+        titulo = msg.content[0].text.strip()
+        chat_id = update.effective_chat.id
+        _trello_suggestion_pending[chat_id] = {'titulo': titulo, 'descricao': ''}
+        text, markup = _trello_suggestion_markup(titulo)
+        await update.message.reply_text(text, reply_markup=markup, parse_mode='Markdown')
+    except Exception as e:
+        await update.message.reply_text(f'❌ Erro ao analisar imagem: {e}')
+
+
+@only_authorized
+async def handle_audio_or_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not claude_client:
+        await update.message.reply_text('❌ ANTHROPIC_API_KEY não configurada.')
+        return
+    await update.message.reply_text('🎙️ Transcrevendo áudio...')
+    if update.message.voice:
+        file_id = update.message.voice.file_id
+        mime = 'audio/ogg'
+    else:
+        audio = update.message.audio
+        file_id = audio.file_id
+        mime_map = {
+            'audio/ogg': 'audio/ogg', 'audio/mpeg': 'audio/mpeg',
+            'audio/mp3': 'audio/mpeg', 'audio/mp4': 'audio/mp4',
+            'audio/wav': 'audio/wav', 'audio/flac': 'audio/flac',
+            'audio/webm': 'audio/webm',
+        }
+        mime = mime_map.get(audio.mime_type or '', 'audio/mpeg')
+    file = await context.bot.get_file(file_id)
+    audio_bytes = bytes(await file.download_as_bytearray())
+    b64 = base64.b64encode(audio_bytes).decode()
+    try:
+        msg = claude_client.messages.create(
+            model='claude-sonnet-4-6',
+            max_tokens=400,
+            messages=[{'role': 'user', 'content': [
+                {'type': 'text', 'text': (
+                    'Você é o assistente de Marcos Lima, contador tributário da Compliance-CE. '
+                    'Transcreva o áudio e sugira um título curto (máx 80 caracteres) para um card do Trello '
+                    'representando a demanda mencionada. Responda exatamente neste formato:\n'
+                    'TRANSCRIÇÃO: [o que foi dito]\n'
+                    'CARD: [título sugerido]'
+                )},
+                {'type': 'document', 'source': {'type': 'base64', 'media_type': mime, 'data': b64}},
+            ]}]
+        )
+        response_text = msg.content[0].text.strip()
+        titulo = response_text.split('CARD:')[-1].strip() if 'CARD:' in response_text else response_text
+        transcricao = ''
+        if 'TRANSCRIÇÃO:' in response_text:
+            for line in response_text.split('\n'):
+                if line.startswith('TRANSCRIÇÃO:'):
+                    transcricao = line.replace('TRANSCRIÇÃO:', '').strip()
+                    break
+        chat_id = update.effective_chat.id
+        _trello_suggestion_pending[chat_id] = {'titulo': titulo, 'descricao': transcricao}
+        if transcricao:
+            await update.message.reply_text(f'🎙️ _{transcricao[:300]}_', parse_mode='Markdown')
+        text, markup = _trello_suggestion_markup(titulo)
+        await update.message.reply_text(text, reply_markup=markup, parse_mode='Markdown')
+    except Exception as e:
+        await update.message.reply_text(f'❌ Erro ao processar áudio: {e}')
+
+
 # ─── HANDLERS ────────────────────────────────────────────────────────────────
 
 def only_authorized(func):
@@ -2026,6 +2131,55 @@ async def handle_callback_query(update, context):
                 chat_id=CHAT_ID,
                 text=f'↩️ Respondendo para: {name}\n📌 Re: {email_data["subject"]}\n\nDigite sua resposta:'
             )
+        return
+
+    # ── Sugestão de card (foto/áudio) ─────────────────────────────────────────
+    if action == 'tsx':
+        _trello_suggestion_pending.pop(chat_id, None)
+        await query.edit_message_text('❌ Cancelado.')
+        return
+
+    if action == 'tse':
+        pending = _trello_suggestion_pending.get(chat_id)
+        if not pending:
+            await query.edit_message_text('❌ Sessão expirada. Tente novamente.')
+            return
+        _trello_edit_pending[chat_id] = pending
+        await query.edit_message_text(
+            f'✏️ Título atual:\n_{pending["titulo"]}_\n\nDigite o novo título:',
+            parse_mode='Markdown'
+        )
+        return
+
+    if action == 'tsc':
+        pending = _trello_suggestion_pending.pop(chat_id, None)
+        if not pending:
+            await query.edit_message_text('❌ Sessão expirada. Tente novamente.')
+            return
+        await query.edit_message_text('🔍 Buscando colunas do Trello...')
+        board_id, _ = get_trello_board_by_name('Arranje tempo para Problemas de verdade')
+        if not board_id:
+            await query.edit_message_text('❌ Board não encontrado.')
+            return
+        lists = get_trello_lists(board_id)
+        if not lists:
+            await query.edit_message_text('❌ Nenhuma coluna encontrada.')
+            return
+        _trello_card_pending[chat_id] = {
+            'titulo': pending['titulo'],
+            'descricao': pending.get('descricao', ''),
+            'lists': lists,
+        }
+        from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+        buttons = [
+            [InlineKeyboardButton(f'📋 {name[:45]}', callback_data=f'tc:{idx}')]
+            for idx, (lid, name) in enumerate(lists)
+        ]
+        await query.edit_message_text(
+            f'📌 *{pending["titulo"]}*\n\nEm qual coluna?',
+            reply_markup=InlineKeyboardMarkup(buttons),
+            parse_mode='Markdown'
+        )
         return
 
     # ── Criação de card Trello ─────────────────────────────────────────────────
@@ -2660,6 +2814,15 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text('❌ Erro ao criar pasta. Verifique o acesso ao Drive.')
             return
 
+    # Modo edição de título sugerido (foto/áudio)
+    if chat_id in _trello_edit_pending:
+        novo_titulo = update.message.text.strip()
+        pending = _trello_edit_pending.pop(chat_id)
+        _trello_suggestion_pending[chat_id] = {**pending, 'titulo': novo_titulo}
+        text, markup = _trello_suggestion_markup(novo_titulo)
+        await update.message.reply_text(text, reply_markup=markup, parse_mode='Markdown')
+        return
+
     # Comandos diretos que não precisam de IA
     text_lower = update.message.text.lower().strip()
     if text_lower in ('ajuda', 'help', '/ajuda', '/help'):
@@ -2811,6 +2974,8 @@ def main():
     app.add_handler(CommandHandler('alertas', cmd_alertas))
     app.add_handler(CommandHandler('marcar', cmd_marcar_lido))
     app.add_handler(CommandHandler('ajuda', cmd_help))
+    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_audio_or_voice))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
     async def error_handler(update, context):
