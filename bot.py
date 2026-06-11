@@ -2783,6 +2783,8 @@ async def _show_nav_email(chat_id, bot, edit_msg_id=None):
 # ─── MAIN ────────────────────────────────────────────────────────────────────
 
 def main():
+    import time
+    time.sleep(20)  # aguarda instância anterior ser encerrada pelo Railway
     load_state_from_redis()
 
     app = Application.builder().token(TELEGRAM_TOKEN).build()
