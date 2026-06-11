@@ -1697,6 +1697,16 @@ async def check_alerts(context):
             print(f'Erro check_alerts {acc["user"]}: {e}')
 
 
+# ─── AUTORIZAÇÃO ─────────────────────────────────────────────────────────────
+
+def only_authorized(func):
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if update.effective_chat.id != CHAT_ID:
+            return
+        await func(update, context)
+    return wrapper
+
+
 # ─── MÍDIA → SUGESTÃO DE CARD TRELLO ─────────────────────────────────────────
 
 def _trello_suggestion_markup(titulo):
@@ -1800,13 +1810,6 @@ async def handle_audio_or_voice(update: Update, context: ContextTypes.DEFAULT_TY
 
 
 # ─── HANDLERS ────────────────────────────────────────────────────────────────
-
-def only_authorized(func):
-    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if update.effective_chat.id != CHAT_ID:
-            return
-        await func(update, context)
-    return wrapper
 
 
 @only_authorized
