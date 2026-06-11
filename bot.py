@@ -257,6 +257,24 @@ CLAUDE_TOOLS = [
             }
         }
     },
+    {
+        "name": "criar_card_trello",
+        "description": "Cria um card no board 'Arranje tempo para Problemas de verdade'. Use quando o usuário pedir 'cria um card', 'adiciona no trello', 'lembra de fazer', 'coloca na fila', etc. O bot vai perguntar em qual coluna colocar.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "titulo": {
+                    "type": "string",
+                    "description": "Título do card a ser criado"
+                },
+                "descricao": {
+                    "type": "string",
+                    "description": "Descrição opcional do card (contexto, detalhes, prazo)"
+                }
+            },
+            "required": ["titulo"]
+        }
+    },
 ]
 
 ANTHROPIC_API_KEY = os.environ.get('ANTHROPIC_API_KEY', '')
@@ -328,6 +346,8 @@ _last_parecer = None      # último parecer gerado (pdf_bytes, urls, filename)
 _email_cache = {}         # cache_key -> email_data (para botões de resposta)
 _reply_pending = {}       # chat_id -> email_data (aguardando digitar resposta)
 _nav_state = {}           # chat_id -> {'emails': [...], 'idx': int}
+_trello_card_pending = {} # chat_id -> {'titulo': str, 'descricao': str, 'lists': [(id, name)]}
+_trello_board_cache = {}  # board_name_lower -> (board_id, board_name)
 
 # ─── REDIS — persistência de estado ──────────────────────────────────────────
 
@@ -517,6 +537,69 @@ def create_trello_card_urgent(subject, sender, body_preview, list_id=None):
         resp.raise_for_status()
         card = resp.json()
         return card.get('shortUrl'), None
+    except Exception as e:
+        return None, str(e)
+
+
+# ─── TRELLO — BOARD/LIST HELPERS ─────────────────────────────────────────────
+
+def get_trello_board_by_name(name):
+    """Returns (board_id, board_name) for the board matching name, or (None, None).
+    Results cached in _trello_board_cache."""
+    key = name.lower()
+    if key in _trello_board_cache:
+        return _trello_board_cache[key]
+    if not TRELLO_API_KEY or not TRELLO_TOKEN:
+        return None, None
+    try:
+        resp = requests.get(
+            'https://api.trello.com/1/members/me/boards',
+            params={'key': TRELLO_API_KEY, 'token': TRELLO_TOKEN, 'fields': 'name,id'},
+            timeout=10
+        )
+        resp.raise_for_status()
+        for board in resp.json():
+            if name.lower() in board['name'].lower():
+                result = (board['id'], board['name'])
+                _trello_board_cache[key] = result
+                return result
+    except Exception as e:
+        print(f'get_trello_board_by_name: {e}')
+    return None, None
+
+
+def get_trello_lists(board_id):
+    """Returns list of (list_id, list_name) for all open lists in the board."""
+    if not TRELLO_API_KEY or not TRELLO_TOKEN:
+        return []
+    try:
+        resp = requests.get(
+            f'https://api.trello.com/1/boards/{board_id}/lists',
+            params={'key': TRELLO_API_KEY, 'token': TRELLO_TOKEN, 'filter': 'open', 'fields': 'name,id'},
+            timeout=10
+        )
+        resp.raise_for_status()
+        return [(lst['id'], lst['name']) for lst in resp.json()]
+    except Exception as e:
+        print(f'get_trello_lists: {e}')
+        return []
+
+
+def create_trello_card(list_id, name, desc='', pos='top'):
+    """Creates a card in the given list. Returns (card_url, error)."""
+    if not TRELLO_API_KEY or not TRELLO_TOKEN:
+        return None, 'Credenciais Trello não configuradas'
+    try:
+        resp = requests.post(
+            'https://api.trello.com/1/cards',
+            params={
+                'key': TRELLO_API_KEY, 'token': TRELLO_TOKEN,
+                'idList': list_id, 'name': name, 'desc': desc, 'pos': pos,
+            },
+            timeout=10
+        )
+        resp.raise_for_status()
+        return resp.json().get('shortUrl'), None
     except Exception as e:
         return None, str(e)
 
@@ -1943,6 +2026,33 @@ async def handle_callback_query(update, context):
             )
         return
 
+    # ── Criação de card Trello ─────────────────────────────────────────────────
+    if action == 'tc':
+        idx = int(parts[1]) if len(parts) > 1 else 0
+        chat_id = query.message.chat.id
+        pending = _trello_card_pending.pop(chat_id, None)
+        if not pending:
+            await query.edit_message_text('❌ Sessão expirada. Tente novamente.')
+            return
+        lists = pending['lists']
+        if idx >= len(lists):
+            await query.edit_message_text('❌ Coluna inválida.')
+            return
+        list_id, list_name = lists[idx]
+        titulo = pending['titulo']
+        descricao = pending.get('descricao', '')
+        card_url, err = create_trello_card(list_id, titulo, descricao)
+        if card_url:
+            await query.edit_message_text(
+                f'✅ Card criado!\n\n'
+                f'📌 {titulo}\n'
+                f'📋 Coluna: {list_name}\n'
+                f'🔗 {card_url}'
+            )
+        else:
+            await query.edit_message_text(f'❌ Erro ao criar card: {err}')
+        return
+
     # ── Fluxo de parecer (ações com fid numérico) ──────────────────────────────
     try:
         fid = int(parts[1])
@@ -2425,6 +2535,34 @@ async def _execute_tool(tool_name, tool_input, update, context):
         chat_id = update.effective_chat.id
         _nav_state[chat_id] = {'emails': emails, 'idx': 0}
         await _show_nav_email(chat_id, context.bot)
+
+    elif tool_name == 'criar_card_trello':
+        titulo = tool_input.get('titulo', '').strip()
+        descricao = tool_input.get('descricao', '')
+        if not titulo:
+            await update.message.reply_text('❓ Qual o título do card?')
+            return
+        await update.message.reply_text('🔍 Buscando colunas do Trello...')
+        board_id, board_name = get_trello_board_by_name('Arranje tempo para Problemas de verdade')
+        if not board_id:
+            await update.message.reply_text('❌ Board "Arranje tempo para Problemas de verdade" não encontrado.')
+            return
+        lists = get_trello_lists(board_id)
+        if not lists:
+            await update.message.reply_text('❌ Nenhuma coluna encontrada no board.')
+            return
+        chat_id = update.effective_chat.id
+        _trello_card_pending[chat_id] = {'titulo': titulo, 'descricao': descricao, 'lists': lists}
+        from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+        buttons = [
+            [InlineKeyboardButton(f'📋 {name[:45]}', callback_data=f'tc:{idx}')]
+            for idx, (lid, name) in enumerate(lists)
+        ]
+        await update.message.reply_text(
+            f'📌 *{titulo}*\n\nEm qual coluna?',
+            reply_markup=InlineKeyboardMarkup(buttons),
+            parse_mode='Markdown'
+        )
 
     elif tool_name == 'reenviar_pdf':
         from telegram import InputFile
