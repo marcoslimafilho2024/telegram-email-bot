@@ -2666,6 +2666,22 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await cmd_help(update, context)
         return
 
+    # Detecção direta de criação de card Trello (sem depender do LLM)
+    _trello_match = re.match(
+        r'(?:cria[r]?\s+(?:um\s+)?card\s*[:\-]\s*|'
+        r'adiciona\s+(?:no\s+)?trello\s*[:\-]\s*|'
+        r'coloca\s+(?:na\s+fila|no\s+trello)\s*[:\-]\s*|'
+        r'lembra\s+(?:de\s+)?(?:fazer\s+)?|'
+        r'nova\s+tarefa\s*[:\-]\s*)'
+        r'(.+)',
+        update.message.text.strip(),
+        re.IGNORECASE | re.DOTALL,
+    )
+    if _trello_match:
+        titulo = _trello_match.group(1).strip()
+        await _execute_tool('criar_card_trello', {'titulo': titulo}, update, context)
+        return
+
     # Sem Claude configurado — fallback para help
     if not claude_client:
         await update.message.reply_text('❌ ANTHROPIC_API_KEY não configurada.')
