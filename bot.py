@@ -2829,6 +2829,36 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await cmd_help(update, context)
         return
 
+    # Mensagem longa (email, thread, conteúdo colado) → analisar e sugerir card
+    if len(user_text) > 300 and claude_client:
+        await update.message.reply_text('🔍 Analisando...')
+        try:
+            msg = claude_client.messages.create(
+                model='claude-haiku-4-5-20251001',
+                max_tokens=300,
+                messages=[{'role': 'user', 'content': (
+                    'Você é o assistente de Marcos Lima, contador tributário da Compliance-CE. '
+                    'Analise o texto e responda EXATAMENTE neste formato (sem mais nada):\n'
+                    'RESUMO: [1-2 linhas descrevendo do que se trata]\n'
+                    'CARD: [título curto, máx 80 chars, para um card do Trello]\n\n'
+                    f'Texto:\n{user_text[:4000]}'
+                )}]
+            )
+            resp = msg.content[0].text.strip()
+            resumo = next(
+                (l.replace('RESUMO:', '').strip() for l in resp.split('\n') if l.startswith('RESUMO:')),
+                ''
+            )
+            titulo = resp.split('CARD:')[-1].strip() if 'CARD:' in resp else resp[:80]
+            _trello_suggestion_pending[chat_id] = {'titulo': titulo, 'descricao': resumo}
+            if resumo:
+                await update.message.reply_text(f'📝 {resumo}')
+            text, markup = _trello_suggestion_markup(titulo)
+            await update.message.reply_text(text, reply_markup=markup, parse_mode='Markdown')
+        except Exception as e:
+            await update.message.reply_text(f'❌ Erro ao analisar: {e}')
+        return
+
     # Detecção direta de criação de card Trello (sem depender do LLM)
     _trello_match = re.match(
         r'(?:cria[r]?\s+(?:um\s+)?card\s*[:\-]\s*|'
