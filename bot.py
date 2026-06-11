@@ -2827,7 +2827,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # Comandos diretos que não precisam de IA
-    text_lower = update.message.text.lower().strip()
+    user_text = update.message.text.strip()
+    text_lower = user_text.lower()
     if text_lower in ('ajuda', 'help', '/ajuda', '/help'):
         await cmd_help(update, context)
         return
@@ -2884,7 +2885,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # ── Claude como cérebro ──────────────────────────────────────────────────
-    user_text = update.message.text.strip()
     context_note = ''
     if _parecer_pending:
         n = len(_parecer_pending)
