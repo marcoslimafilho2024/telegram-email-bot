@@ -283,6 +283,9 @@ CLAUDE_TOOLS = [
 ANTHROPIC_API_KEY = os.environ.get('ANTHROPIC_API_KEY', '')
 claude_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY) if ANTHROPIC_API_KEY else None
 
+# ─── PAINEL / AGENTE LOCAL (comando /rodar) ───────────────────────────────────
+PANEL_URL = os.environ.get('PANEL_URL', 'https://painel-demandas-compliance-production.up.railway.app')
+
 # ─── TRELLO ───────────────────────────────────────────────────────────────────
 TRELLO_API_KEY = os.environ.get('TRELLO_API_KEY', '')
 TRELLO_TOKEN = os.environ.get('TRELLO_TOKEN', '')
@@ -3001,6 +3004,28 @@ async def _show_nav_email(chat_id, bot, edit_msg_id=None):
     await bot.send_message(chat_id=chat_id, text=text[:4096], reply_markup=markup)
 
 
+# ─── /rodar — aciona o agente local (MEGAZORD) direto pelo Telegram ───────────
+
+async def cmd_rodar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.id != CHAT_ID:
+        return
+    texto = re.sub(r'^/rodar(@\w+)?\s*', '', update.message.text or '', flags=re.IGNORECASE).strip()
+    if not texto:
+        await update.message.reply_text(
+            '⚙️ Uso: /rodar <instrução>\n'
+            'Ex: /rodar analisa a pasta X e me manda um resumo\n\n'
+            'O agente roda na MEGAZORD e o resultado chega aqui no Telegram.'
+        )
+        return
+    await update.message.reply_text('🚀 Acionando o agente — o resultado chega aqui quando terminar.')
+    try:
+        r = requests.post(f'{PANEL_URL}/rodar', json={'prompt': texto}, timeout=40)
+        if r.status_code != 200:
+            await update.message.reply_text(f'⚠️ Não consegui acionar (HTTP {r.status_code}): {r.text[:300]}')
+    except Exception as e:
+        await update.message.reply_text(f'❌ Falha ao acionar o agente: {e}')
+
+
 # ─── MAIN ────────────────────────────────────────────────────────────────────
 
 def main():
@@ -3032,6 +3057,7 @@ def main():
     app.add_handler(CommandHandler('alertas', cmd_alertas))
     app.add_handler(CommandHandler('marcar', cmd_marcar_lido))
     app.add_handler(CommandHandler('ajuda', cmd_help))
+    app.add_handler(CommandHandler('rodar', cmd_rodar))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_audio_or_voice))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
