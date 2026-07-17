@@ -278,6 +278,11 @@ CLAUDE_TOOLS = [
             "required": ["titulo"]
         }
     },
+    {
+        "name": "proximo_recebimento_ipog",
+        "description": "Consulta no Google Calendar o(s) próximo(s) recebimento(s)/pagamento(s) do IPOG, criados automaticamente a partir das confirmações de NF recebidas por email. Use para 'quando é meu próximo recebimento do IPOG', 'quando vou receber do IPOG', 'próximo pagamento IPOG', 'tem recebimento do IPOG chegando'.",
+        "input_schema": {"type": "object", "properties": {}}
+    },
 ]
 
 ANTHROPIC_API_KEY = os.environ.get('ANTHROPIC_API_KEY', '')
@@ -1224,6 +1229,27 @@ def create_ipog_payment_event(body):
         return created.get('htmlLink'), valor, None
     except Exception as e:
         return None, valor, str(e)
+
+
+def find_next_ipog_payments(max_results=5):
+    """Busca no calendário os próximos eventos de recebimento IPOG (criados
+    pela regra de confirmação de NF). Retorna (lista_eventos, erro)."""
+    svc = _calendar_service()
+    if not svc:
+        return [], 'GOOGLE_SERVICE_ACCOUNT_JSON não configurado'
+    try:
+        now = datetime.utcnow().isoformat() + 'Z'
+        res = svc.events().list(
+            calendarId=IPOG_CALENDAR_ID, timeMin=now, q='RECEBIMENTO IPOG',
+            singleEvents=True, orderBy='startTime', maxResults=max_results,
+        ).execute()
+        events = [
+            {'data': e['start'].get('date') or e['start'].get('dateTime', '')[:10], 'titulo': e.get('summary', '')}
+            for e in res.get('items', [])
+        ]
+        return events, None
+    except Exception as e:
+        return [], str(e)
 
 
 def list_drive_subfolders(parent_id):
@@ -2860,6 +2886,20 @@ async def _execute_tool(tool_name, tool_input, update, context):
                 f'✅ Email enviado para {p["email_data"]["sender"]}' if ok
                 else f'❌ Falha ao enviar email: {err}'
             )
+
+    elif tool_name == 'proximo_recebimento_ipog':
+        events, err = find_next_ipog_payments()
+        if err:
+            await update.message.reply_text(f'❌ Erro ao consultar o calendário: {err}')
+        elif not events:
+            await update.message.reply_text('📭 Nenhum recebimento do IPOG agendado no calendário no momento.')
+        else:
+            prox = events[0]
+            lines = [f'📅 Próximo recebimento IPOG: {prox["data"]}\n{prox["titulo"]}']
+            if len(events) > 1:
+                lines.append('\nOutros agendados:')
+                lines.extend(f'  • {e["data"]} — {e["titulo"]}' for e in events[1:])
+            await update.message.reply_text('\n'.join(lines))
 
 
 @only_authorized

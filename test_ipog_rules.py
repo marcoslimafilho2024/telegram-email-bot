@@ -41,4 +41,11 @@ assert 'GOOGLE_SERVICE_ACCOUNT_JSON' in err, err
 link, valor, err = bot.create_ipog_payment_event('sem nada relevante aqui')
 assert link is None and err == 'Data de pagamento não encontrada no email'
 
+# 5) consulta "próximo recebimento IPOG" também falha graciosamente sem credencial
+events, err = bot.find_next_ipog_payments()
+assert events == [] and 'GOOGLE_SERVICE_ACCOUNT_JSON' in err, (events, err)
+
+# 6) a ferramenta está registrada pro Claude poder escolhê-la
+assert any(t['name'] == 'proximo_recebimento_ipog' for t in bot.CLAUDE_TOOLS)
+
 print('OK — regras IPOG e extração de data/valor validadas')
