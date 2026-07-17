@@ -295,6 +295,9 @@ TRELLO_LABEL_URGENTE_ID = os.environ.get('TRELLO_LABEL_URGENTE_ID', '')
 # ─── DRIVE PARECER ────────────────────────────────────────────────────────────
 DRIVE_PARECER_ROOT_ID = os.environ.get('DRIVE_PARECER_ROOT_ID', '1Jd3oC3gNQoYXPUuKKBF8PrMZNUEkKT9m')
 
+# ─── CALENDÁRIO — RECEBIMENTOS IPOG ───────────────────────────────────────────
+IPOG_CALENDAR_ID = os.environ.get('IPOG_CALENDAR_ID', 'marcoslima@compliance-ce.com.br')
+
 # ─── REGRAS AUTOMÁTICAS ───────────────────────────────────────────────────────
 # Quando email bate numa regra: alerta Telegram + encaminha automaticamente
 
@@ -314,12 +317,21 @@ RULES = [
         'priority': 'URGENTE',
     },
     {
+        'name': 'IPOG — Confirmação de Recebimento NF',
+        'match_from': ['nf@ipog.edu.br', 'ipog.edu.br'],
+        'match_subject': ['solicitação nf', 'solicitacao nf', 'nota fiscal', 'nf semana'],
+        'match_subject_prefix': ['res:', 're:'],  # só respostas do IPOG = confirmação
+        'action': 'calendar_event',
+        'alert_msg': '📅 IPOG — Confirmação de recebimento de NF!',
+        'priority': 'URGENTE',
+    },
+    {
         'name': 'IPOG — Solicitação de NF',
         'match_from': ['nf@ipog.edu.br', 'ipog.edu.br'],
         'match_subject': ['solicitação nf', 'solicitacao nf', 'nota fiscal', 'nf semana'],
         'forward_to': ['vanessa2mlima@gmail.com', 'vanessalima@compliance-ce.com.br'],
         'forward_from_account': 'cnp',
-        'alert_msg': '🚨 IPOG — Solicitação de NF recebida!\nEncaminhado para Vanessa automaticamente.',
+        'alert_msg': '🚨 IPOG — Solicitação de NF recebida! ALERTANDO que precisamos EMITIR A NOTA FISCAL.\nEncaminhado para Vanessa automaticamente.',
         'priority': 'URGENTE',
     },
     {
@@ -690,6 +702,8 @@ def match_rule(sender, subject):
     """Retorna a regra que bate com o email, ou None.
     match_logic 'and' (padrão): remetente E assunto devem bater.
     match_logic 'or': qualquer um dos dois basta.
+    match_subject_prefix (opcional): assunto precisa COMEÇAR com um dos prefixos
+    (usado para distinguir resposta 'RES:'/'RE:' do email original).
     """
     s, sub = sender.lower(), subject.lower()
     for rule in RULES:
@@ -697,6 +711,9 @@ def match_rule(sender, subject):
         subj_match = any(x in sub for x in rule['match_subject'])
         logic = rule.get('match_logic', 'and')
         matched = (from_match or subj_match) if logic == 'or' else (from_match and subj_match)
+        prefixes = rule.get('match_subject_prefix')
+        if prefixes and not any(sub.startswith(p) for p in prefixes):
+            matched = False
         if matched:
             return rule
     return None
@@ -741,8 +758,9 @@ def forward_email(original_msg_bytes, rule, acc):
         return False, err
 
 
-def get_email_body(msg):
-    """Extrai o texto do corpo do email."""
+def get_email_body(msg, limit=3000):
+    """Extrai o texto do corpo do email. limit=None retorna o corpo inteiro
+    (necessário para achar dados enterrados na cadeia de respostas citadas)."""
     body = ''
     if msg.is_multipart():
         for part in msg.walk():
@@ -758,7 +776,8 @@ def get_email_body(msg):
             body = msg.get_payload(decode=True).decode(msg.get_content_charset() or 'utf-8', errors='replace')
         except:
             body = str(msg.get_payload())
-    return body.strip()[:3000]  # limite para API
+    body = body.strip()
+    return body[:limit] if limit else body  # limite para API, exceto quando None
 
 
 def search_email_by_name(name_query):
@@ -1166,6 +1185,45 @@ def _drive_service():
         _j.loads(sa_json), scopes=['https://www.googleapis.com/auth/drive']
     )
     return build('drive', 'v3', credentials=creds)
+
+
+def _calendar_service():
+    sa_json = os.environ.get('GOOGLE_SERVICE_ACCOUNT_JSON', '')
+    if not sa_json:
+        return None
+    import json as _j
+    from google.oauth2 import service_account
+    from googleapiclient.discovery import build
+    creds = service_account.Credentials.from_service_account_info(
+        _j.loads(sa_json), scopes=['https://www.googleapis.com/auth/calendar']
+    )
+    return build('calendar', 'v3', credentials=creds)
+
+
+def create_ipog_payment_event(body):
+    """Extrai data de pagamento e valor da confirmação de recebimento de NF do
+    IPOG (dados ficam citados na cadeia de emails) e cria evento no calendário.
+    Retorna (link_evento, valor, erro)."""
+    date_m = re.search(r'programad[ao]\s+para\s+o\s+dia\s+(\d{2}/\d{2}/\d{4})', body, re.I)
+    value_m = re.search(r'VALOR DA NOTA FISCAL:\s*R\$\s*([\d.,]+)', body, re.I)
+    if not date_m:
+        return None, None, 'Data de pagamento não encontrada no email'
+    dia, mes, ano = date_m.group(1).split('/')
+    valor = value_m.group(1) if value_m else '?'
+    svc = _calendar_service()
+    if not svc:
+        return None, valor, 'GOOGLE_SERVICE_ACCOUNT_JSON não configurado'
+    event = {
+        'summary': f'ATENÇÃO - RECEBIMENTO IPOG - VALOR DA NOTA FISCAL: R$ {valor}',
+        'description': 'Data de pagamento programada conforme confirmação de recebimento de NF do IPOG.',
+        'start': {'date': f'{ano}-{mes}-{dia}'},
+        'end': {'date': f'{ano}-{mes}-{dia}'},
+    }
+    try:
+        created = svc.events().insert(calendarId=IPOG_CALENDAR_ID, body=event).execute()
+        return created.get('htmlLink'), valor, None
+    except Exception as e:
+        return None, valor, str(e)
 
 
 def list_drive_subfolders(parent_id):
@@ -1590,6 +1648,14 @@ async def check_alerts(context):
                             detail = f'✅ Card criado no topo (URGENTE):\n{card_url}'
                         else:
                             detail = f'❌ Falha ao criar card Trello\n⚠️ {(err_msg or "erro desconhecido")[:300]}'
+                    elif action == 'calendar_event':
+                        full_msg = email.message_from_bytes(full_raw)
+                        body = get_email_body(full_msg, limit=None)
+                        link, valor, err = create_ipog_payment_event(body)
+                        if link:
+                            detail = f'✅ Evento criado no calendário — R$ {valor}\n{link}'
+                        else:
+                            detail = f'❌ Não foi possível criar o evento (valor: R$ {valor or "?"})\n⚠️ {err}'
                     else:
                         ok, err_msg = forward_email(full_raw, rule, acc)
                         destinos = '\n'.join(f'  • {d}' for d in rule['forward_to'])
