@@ -45,7 +45,12 @@ assert link is None and err == 'Data de pagamento não encontrada no email'
 events, err = bot.find_next_ipog_payments()
 assert events == [] and 'GOOGLE_SERVICE_ACCOUNT_JSON' in err, (events, err)
 
-# 6) a ferramenta está registrada pro Claude poder escolhê-la
+# 6) as ferramentas estão registradas pro Claude poder escolhê-las
 assert any(t['name'] == 'proximo_recebimento_ipog' for t in bot.CLAUDE_TOOLS)
+assert any(t['name'] == 'varredura_ipog_calendario' for t in bot.CLAUDE_TOOLS)
+
+# 7) varredura histórica falha graciosamente sem credencial (não tenta IMAP à toa)
+resultados, err = bot.scan_ipog_history(months=3)
+assert resultados == [] and 'GOOGLE_SERVICE_ACCOUNT_JSON' in err, (resultados, err)
 
 print('OK — regras IPOG e extração de data/valor validadas')

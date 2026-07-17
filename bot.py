@@ -283,6 +283,16 @@ CLAUDE_TOOLS = [
         "description": "Consulta no Google Calendar o(s) próximo(s) recebimento(s)/pagamento(s) do IPOG, criados automaticamente a partir das confirmações de NF recebidas por email. Use para 'quando é meu próximo recebimento do IPOG', 'quando vou receber do IPOG', 'próximo pagamento IPOG', 'tem recebimento do IPOG chegando'.",
         "input_schema": {"type": "object", "properties": {}}
     },
+    {
+        "name": "varredura_ipog_calendario",
+        "description": "Varre o histórico de emails de confirmação de recebimento de NF do IPOG (assunto RES:/RE:) nas duas contas monitoradas e cria no calendário os pagamentos que ainda não estão lá, sem duplicar os que já existem. Use para 'varre os últimos meses de notas do IPOG', 'inclui as previsões de recebimento no calendário', 'atualiza o calendário com o histórico do IPOG'.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "meses": {"type": "integer", "description": "Quantos meses para trás varrer (padrão 3)"}
+            }
+        }
+    },
 ]
 
 ANTHROPIC_API_KEY = os.environ.get('ANTHROPIC_API_KEY', '')
@@ -1205,30 +1215,94 @@ def _calendar_service():
     return build('calendar', 'v3', credentials=creds)
 
 
+def _parse_ipog_confirmacao(body):
+    """Extrai (data_iso 'AAAA-MM-DD', valor) da confirmação de recebimento de
+    NF do IPOG. data_iso vem None se não achar a data de pagamento."""
+    date_m = re.search(r'programad[ao]\s+para\s+o\s+dia\s+(\d{2}/\d{2}/\d{4})', body, re.I)
+    value_m = re.search(r'VALOR DA NOTA FISCAL:\s*R\$\s*([\d.,]+)', body, re.I)
+    valor = value_m.group(1) if value_m else '?'
+    if not date_m:
+        return None, valor
+    dia, mes, ano = date_m.group(1).split('/')
+    return f'{ano}-{mes}-{dia}', valor
+
+
+def _ipog_event_body(data_iso, valor, origem='confirmação de recebimento de NF do IPOG'):
+    return {
+        'summary': f'ATENÇÃO - RECEBIMENTO IPOG - VALOR DA NOTA FISCAL: R$ {valor}',
+        'description': f'Data de pagamento programada conforme {origem}.',
+        'start': {'date': data_iso},
+        'end': {'date': data_iso},
+    }
+
+
 def create_ipog_payment_event(body):
     """Extrai data de pagamento e valor da confirmação de recebimento de NF do
     IPOG (dados ficam citados na cadeia de emails) e cria evento no calendário.
     Retorna (link_evento, valor, erro)."""
-    date_m = re.search(r'programad[ao]\s+para\s+o\s+dia\s+(\d{2}/\d{2}/\d{4})', body, re.I)
-    value_m = re.search(r'VALOR DA NOTA FISCAL:\s*R\$\s*([\d.,]+)', body, re.I)
-    if not date_m:
+    data_iso, valor = _parse_ipog_confirmacao(body)
+    if not data_iso:
         return None, None, 'Data de pagamento não encontrada no email'
-    dia, mes, ano = date_m.group(1).split('/')
-    valor = value_m.group(1) if value_m else '?'
     svc = _calendar_service()
     if not svc:
         return None, valor, 'GOOGLE_SERVICE_ACCOUNT_JSON não configurado'
-    event = {
-        'summary': f'ATENÇÃO - RECEBIMENTO IPOG - VALOR DA NOTA FISCAL: R$ {valor}',
-        'description': 'Data de pagamento programada conforme confirmação de recebimento de NF do IPOG.',
-        'start': {'date': f'{ano}-{mes}-{dia}'},
-        'end': {'date': f'{ano}-{mes}-{dia}'},
-    }
     try:
-        created = svc.events().insert(calendarId=IPOG_CALENDAR_ID, body=event).execute()
+        created = svc.events().insert(calendarId=IPOG_CALENDAR_ID, body=_ipog_event_body(data_iso, valor)).execute()
         return created.get('htmlLink'), valor, None
     except Exception as e:
         return None, valor, str(e)
+
+
+def scan_ipog_history(months=3):
+    """Varre nas duas contas os emails de confirmação do IPOG (assunto RES:/RE:)
+    dos últimos `months` meses e cria no calendário os que ainda não estão lá.
+    Retorna (lista de {'data','valor','status'}, erro_geral)."""
+    svc = _calendar_service()
+    if not svc:
+        return [], 'GOOGLE_SERVICE_ACCOUNT_JSON não configurado'
+
+    janela_ini = datetime.now() - timedelta(days=30 * months)
+    try:
+        res = svc.events().list(
+            calendarId=IPOG_CALENDAR_ID, q='RECEBIMENTO IPOG',
+            timeMin=janela_ini.isoformat() + 'Z',
+            timeMax=(datetime.now() + timedelta(days=365)).isoformat() + 'Z',
+            singleEvents=True, maxResults=250,
+        ).execute()
+        existentes = {e['start'].get('date') for e in res.get('items', []) if e['start'].get('date')}
+    except Exception as e:
+        return [], f'Erro ao ler calendário: {e}'
+
+    since = janela_ini.strftime('%d-%b-%Y')
+    resultados = []
+    for acc in ACCOUNTS:
+        try:
+            mail = get_imap(acc['user'], acc['password'], readonly=True)
+            _, data = mail.search(None, f'(FROM "ipog.edu.br" SINCE {since})')
+            for eid in data[0].split():
+                _, hdr_data = mail.fetch(eid, '(BODY.PEEK[HEADER.FIELDS (SUBJECT)])')
+                subj = decode_str(email.message_from_bytes(hdr_data[0][1]).get('Subject', ''))
+                if not subj.lower().startswith(('res:', 're:')):
+                    continue  # só a resposta (confirmação), não a solicitação original
+                _, full_data = mail.fetch(eid, '(BODY.PEEK[])')
+                body = get_email_body(email.message_from_bytes(full_data[0][1]), limit=None)
+                data_iso, valor = _parse_ipog_confirmacao(body)
+                if not data_iso:
+                    continue
+                if data_iso in existentes:
+                    resultados.append({'data': data_iso, 'valor': valor, 'status': 'já existia'})
+                    continue
+                try:
+                    svc.events().insert(calendarId=IPOG_CALENDAR_ID, body=_ipog_event_body(
+                        data_iso, valor, origem='varredura histórica de emails do IPOG')).execute()
+                    existentes.add(data_iso)
+                    resultados.append({'data': data_iso, 'valor': valor, 'status': 'criado'})
+                except Exception as e:
+                    resultados.append({'data': data_iso, 'valor': valor, 'status': f'erro: {e}'})
+            mail.logout()
+        except Exception as e:
+            resultados.append({'data': '?', 'valor': '?', 'status': f'erro na conta {acc["label"]}: {e}'})
+    return resultados, None
 
 
 def find_next_ipog_payments(max_results=5):
@@ -2900,6 +2974,30 @@ async def _execute_tool(tool_name, tool_input, update, context):
                 lines.append('\nOutros agendados:')
                 lines.extend(f'  • {e["data"]} — {e["titulo"]}' for e in events[1:])
             await update.message.reply_text('\n'.join(lines))
+
+    elif tool_name == 'varredura_ipog_calendario':
+        meses = tool_input.get('meses', 3)
+        await update.message.reply_text(f'🔍 Varrendo os últimos {meses} meses de emails do IPOG nas duas contas...')
+        resultados, err = scan_ipog_history(months=meses)
+        if err:
+            await update.message.reply_text(f'❌ Erro: {err}')
+        elif not resultados:
+            await update.message.reply_text('📭 Nenhuma confirmação de recebimento do IPOG encontrada no período.')
+        else:
+            criados = [r for r in resultados if r['status'] == 'criado']
+            existentes = [r for r in resultados if r['status'] == 'já existia']
+            erros = [r for r in resultados if r['status'].startswith('erro')]
+            lines = [f'📅 Varredura IPOG ({meses} meses) — {len(resultados)} confirmação(ões) encontrada(s)']
+            if criados:
+                lines.append('\n✅ Criados no calendário:')
+                lines.extend(f'  • {r["data"]} — R$ {r["valor"]}' for r in criados)
+            if existentes:
+                lines.append('\n↩️ Já estavam no calendário:')
+                lines.extend(f'  • {r["data"]} — R$ {r["valor"]}' for r in existentes)
+            if erros:
+                lines.append('\n⚠️ Erros:')
+                lines.extend(f'  • {r["data"]} — {r["status"]}' for r in erros)
+            await _send_long('\n'.join(lines))
 
 
 @only_authorized
